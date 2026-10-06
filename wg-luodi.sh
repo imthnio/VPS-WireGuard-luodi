@@ -62,7 +62,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.0"
+WGL_VERSION="1.1.1"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -200,6 +200,15 @@ detect_init() {
   fi
 }
 
+# Alpine 系统却跑着别家的内核（比如 6.12.x+deb13-cloud）：说明是和母鸡共用内核的容器小鸡。
+# Alpine 自己的内核名字里都带 -virt / -lts / -edge / -rpi。
+_alpine_foreign_kernel() {
+  [ -f /etc/alpine-release ] || return 1
+  case "$(uname -r)" in *-virt|*-lts|*-edge|*-rpi*|*-virt-*|*-lts-*) return 1 ;; esac
+  return 0
+}
+
+# 机器类型：母鸡 / KVM / OpenVZ / LXC 等。容器的判断放在前面，因为容器里看到的硬件信息是母鸡的。
 detect_virt() {
   VIRT=""
   if _has systemd-detect-virt; then
@@ -214,6 +223,9 @@ detect_virt() {
     elif grep -qa 'container=lxc' /proc/1/environ 2>/dev/null; then VIRT=lxc
     elif [ -f /.dockerenv ]; then VIRT=docker
     elif grep -q '/lxc/' /proc/1/cgroup 2>/dev/null; then VIRT=lxc
+    elif grep -q 'lxcfs' /proc/mounts 2>/dev/null || [ -e /dev/.lxc-boot-id ] || [ -e /dev/.lxc ]; then VIRT=lxc
+    elif [ -s /run/systemd/container ]; then VIRT=$(head -n 1 /run/systemd/container | tr -d ' \r')
+    elif _alpine_foreign_kernel; then VIRT=lxc
     elif grep -qi 'kvm\|qemu' /sys/class/dmi/id/product_name 2>/dev/null || grep -qi 'kvm\|qemu' /sys/class/dmi/id/sys_vendor 2>/dev/null; then VIRT=kvm
     elif grep -q '^flags.* hypervisor' /proc/cpuinfo 2>/dev/null; then VIRT=vm
     elif [ -z "$VIRT" ]; then VIRT=none
@@ -387,7 +399,10 @@ is_musl() {
 # 下载一种 sing-box 包、核对 SHA256、解压，并确认能运行。成功就留下 "$SB.new"。
 _sb_fetch() { # _sb_fetch <版本> <包类型，如 amd64-musl> <发布接口内容>
   _asset="sing-box-$1-linux-$2.tar.gz"
-  _tmp=$(mktemp -d "${TMPDIR:-/tmp}/wgl-sb.XXXXXX") || die "建不了临时目录"
+  # 临时文件放在硬盘上（和 sing-box 同一个目录），不放 /tmp：
+  # 很多小内存小鸡的 /tmp 是内存盘，几十 MB 的程序写进去会把内存撑爆，整台小鸡被重启。
+  mkdir -p "$WGL_LIB"
+  _tmp=$(mktemp -d "$WGL_LIB/.dl-sb.XXXXXX") || die "建不了临时目录（$WGL_LIB）"
   info "下载 sing-box $1（$2）…"
   if ! _gh_dl "https://github.com/SagerNet/sing-box/releases/download/v$1/${_asset}" "$_tmp/sb.tgz"; then
     rm -rf "$_tmp"; warn "这个包没下载下来：${_asset}"; return 1
@@ -408,7 +423,7 @@ _sb_fetch() { # _sb_fetch <版本> <包类型，如 amd64-musl> <发布接口内
   tar -xzf "$_tmp/sb.tgz" -C "$_tmp" 2>/dev/null || { rm -rf "$_tmp"; warn "安装包解压失败：${_asset}"; return 1; }
   _bin=$(find "$_tmp" -type f -name sing-box | head -n 1)
   [ -n "$_bin" ] || { rm -rf "$_tmp"; warn "安装包里没找到 sing-box：${_asset}"; return 1; }
-  cp -f "$_bin" "$SB.new" && chmod 755 "$SB.new"
+  mv -f "$_bin" "$SB.new" && chmod 755 "$SB.new"
   rm -rf "$_tmp"
   if ! _sb_ver_ok "$SB.new"; then
     rm -f "$SB.new"; warn "这个包在本机跑不起来（多半是系统 C 库不匹配），换另一个包试试"; return 1
@@ -422,6 +437,12 @@ _sb_fetch() { # _sb_fetch <版本> <包类型，如 amd64-musl> <发布接口内
 _sb_get() { # _sb_get <版本> <发布接口内容>
   detect_arch
   [ -n "$ARCH" ] || return 1
+  # 先看硬盘够不够：安装包加解压出来的程序，大约要 150MB 空间
+  mkdir -p "$WGL_LIB"
+  _free=$(df -Pk "$WGL_LIB" 2>/dev/null | awk 'NR == 2 { print int($4 / 1024) }')
+  if [ -n "$_free" ] && [ "$_free" -lt 150 ] 2>/dev/null; then
+    die "硬盘剩余空间不够：$WGL_LIB 所在的盘只剩 ${_free}MB，下载 sing-box 大约要 150MB。请先清理一下硬盘再运行。"
+  fi
   if is_musl; then _cands="${ARCH}-musl ${ARCH}"; else _cands="${ARCH} ${ARCH}-musl"; fi
   for _flavor in $_cands; do
     _sb_fetch "$1" "$_flavor" "$2" && return 0
@@ -1641,7 +1662,7 @@ _b64url_dec() { # base64url -> 原始字节
 x25519_pub() { # REALITY 私钥 -> 公钥（优先用 xray x25519 -i；没有 xray 就用 openssl）
   if [ -x "$XN_BIN_DIR/xray" ]; then
     _o=$("$XN_BIN_DIR/xray" x25519 -i "$1" 2>/dev/null)
-    _pk=$(printf '%s\n' "$_o" | sed -n 's/^Public key: *//p; s/^Password: *//p; s/^PublicKey: *//p' | head -n 1 | tr -d ' \r')
+    _pk=$(printf '%s\n' "$_o" | sed -n 's/^Public key: *//p; s/^PublicKey: *//p; s/^Password[^:]*: *//p' | head -n 1 | tr -d ' \r')
     [ -n "$_pk" ] && { printf '%s' "$_pk"; return 0; }
   fi
   _has openssl || return 1
@@ -1894,7 +1915,8 @@ do_update() {
   _old_ok=""; gw_active && _old_ok=$(wg_exit_ip)
   _bk="$WGL_DIR/update-backup"; rm -rf "$_bk"; mkdir -p "$_bk"; chmod 700 "$_bk"
   [ -f "$WGL_CMD" ] && cp -p "$WGL_CMD" "$_bk/wg-luodi"
-  [ -x "$SB" ] && cp -p "$SB" "$_bk/sing-box"
+  # sing-box 要换新版时才备份旧的；用硬链接，不多占硬盘（小鸡硬盘可能很小）
+  if [ -f "$SB.new" ] && [ -x "$SB" ]; then ln "$SB" "$_bk/sing-box" 2>/dev/null || cp -p "$SB" "$_bk/sing-box"; fi
   [ -f "$GW_JSON" ] && cp -p "$GW_JSON" "$_bk/gw.json"
   cp -p "$STATE" "$_bk/state"
   # 1. 换上新版管理命令和 sing-box
@@ -2169,6 +2191,7 @@ do_uninstall() {
     [ "$k" = hysteria ] && grep -q '^# wg-luodi begin' "$c" 2>/dev/null && exit 1
     [ "$k" = xray ] || [ "$k" = sing-box ] || continue
     "$JQ" -e '[.outbounds[]? | select(.tag == "wg-luodi")] | length > 0' "$c" >/dev/null 2>&1 && exit 1
+    true   # 这个节点已经干净了（没有这行，最后一个节点干净时循环会返回 1，被误判成“没恢复”）
   done || _bad=1
   step "[2/3] 删除网关服务"
   remove_services

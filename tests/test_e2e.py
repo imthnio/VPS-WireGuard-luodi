@@ -278,6 +278,7 @@ class E2E(unittest.TestCase):
         # ---- 10. 卸载：所有节点配置逐字节还原，文件全部删掉，节点还在正常跑 ----
         r = sb.run_cmd(["uninstall", "-y"], timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("没能自动恢复", r.stdout + r.stderr)     # 最后一个节点是 xray 时也不能误报
         for k, v in self.cfg.items():
             self.assertEqual(v.read_bytes(), self.orig[k], "节点 %d 没还原" % k)
         self.assertFalse(sb.etc.exists())
