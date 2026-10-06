@@ -9,10 +9,11 @@
 #   其它端口上的节点照旧用这台服务器自己的 IP。SSH 和服务器自己的网络完全不动。
 #
 # 用法（root 用户）：
-#   安装 / 重装：   sh wg-luodi.sh
+#   安装：          sh wg-luodi.sh
+#   更新：          装过的服务器再运行一次安装命令就自动更新（配置、端口都保留），或者 wg-luodi update
 #   装好以后管理：  wg-luodi            （中文菜单）
 #   命令行：        wg-luodi status | test | add-port 端口 | del-port 端口 | set-conf [文件]
-#                   wg-luodi mode auto|kernel|userspace | reapply | uninstall
+#                   wg-luodi mode auto|kernel|userspace | reapply | update | uninstall
 #
 # 无人值守（不提问，全部用环境变量）：
 #   WG_CONF_FILE=/root/wg.conf WG_PORTS="45192 50000" WG_MODE=auto sh wg-luodi.sh
@@ -46,6 +47,9 @@
 #       脚本里不写死任何钥匙，全部在运行时由你粘贴。
 # systemd / OpenRC：Linux 管后台程序、让它开机自启的系统。Debian/Ubuntu/CentOS 用 systemd，
 #       Alpine 用 OpenRC。本脚本两种都支持，重启服务器后自动恢复。
+# musl / glibc：Linux 程序依赖的两种“基础库”。Alpine 用 musl，Debian/Ubuntu/CentOS 用 glibc。
+#       用错了程序会报 not found 跑不起来，所以 Alpine 上下载 sing-box 的 -musl 版（静态编译，哪里都能跑）。
+# 更新：换上新版脚本和新版 sing-box，重新生成网关配置；你的 WireGuard 配置和端口原样保留。
 # 巡检：每 2 分钟自动检查一次的小任务。别的脚本重建了节点、或者路由规则被清掉，它会自动补回去。
 # ============================================================
 
@@ -58,7 +62,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.0.0"
+WGL_VERSION="1.1.0"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -412,6 +416,24 @@ _sb_fetch() { # _sb_fetch <版本> <包类型，如 amd64-musl> <发布接口内
   return 0
 }
 
+# 按本机的 C 库挑包下载，成功就留下 "$SB.new"。
+# Alpine 用 musl，Debian/Ubuntu/CentOS 用 glibc。官方 -musl 包是静态编译的（不依赖系统库），glibc 系统也能跑；
+# 普通包要 glibc 加载器，Alpine 上跑不了。所以 musl 系统先试 -musl 包，glibc 系统先试普通包，跑不起来就换另一个。
+_sb_get() { # _sb_get <版本> <发布接口内容>
+  detect_arch
+  [ -n "$ARCH" ] || return 1
+  if is_musl; then _cands="${ARCH}-musl ${ARCH}"; else _cands="${ARCH} ${ARCH}-musl"; fi
+  for _flavor in $_cands; do
+    _sb_fetch "$1" "$_flavor" "$2" && return 0
+  done
+  return 1
+}
+
+# 从 GitHub 查 sing-box 最新正式版的版本号（查不到就打印空）
+_sb_latest_ver() { # 用法：_api=$(_get 发布接口); _sb_latest_ver "$_api"
+  printf '%s' "$1" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1
+}
+
 ensure_singbox() {
   step "[准备] 网关程序 sing-box"
   mkdir -p "$WGL_LIB" && chmod 755 "$WGL_LIB"
@@ -430,17 +452,9 @@ ensure_singbox() {
   detect_arch
   [ -n "$ARCH" ] || die "不认识这台机器的 CPU 架构（$(uname -m)），没法下载 sing-box。"
   _api=$(_get "https://api.github.com/repos/SagerNet/sing-box/releases/latest")
-  _ver=$(printf '%s' "$_api" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)
+  _ver=$(_sb_latest_ver "$_api")
   case "$_ver" in ''|*[!0-9.]*) _ver="$SB_FALLBACK_VER"; _api="" ;; esac
-  # 系统用的是哪种 C 库：Alpine 用 musl，Debian/Ubuntu/CentOS 用 glibc。
-  # 官方 -musl 包是静态编译的（不依赖系统库），glibc 系统也能跑；普通包要 glibc 加载器，Alpine 上跑不了。
-  # 所以 musl 系统先试 -musl 包；glibc 系统先试普通包。第一个跑不起来就自动换另一个。
-  if is_musl; then _cands="${ARCH}-musl ${ARCH}"; else _cands="${ARCH} ${ARCH}-musl"; fi
-  _ok=0
-  for _flavor in $_cands; do
-    if _sb_fetch "$_ver" "$_flavor" "$_api"; then _ok=1; break; fi
-  done
-  [ "$_ok" = 1 ] || die "sing-box 下载失败，或下载的程序在这台机器上跑不起来（C 库不匹配）。请把上面的提示发出来。"
+  _sb_get "$_ver" "$_api" || die "sing-box 下载失败，或下载的程序在这台机器上跑不起来（C 库不匹配）。请把上面的提示发出来。"
   mv -f "$SB.new" "$SB"
   info "sing-box 装好了：$("$SB" version | head -n 1)"
 }
@@ -1813,18 +1827,151 @@ start_and_check_gateway() {
   return 0
 }
 
+# ---------- 22b. 更新 ----------
+# 再运行一次安装命令、或者运行 wg-luodi update，就会更新：
+# 换上新版脚本（管理命令）、有新版 sing-box 就换上、用新版重新生成网关配置和开机服务、重新检查节点。
+# WireGuard 配置、端口、模式、网关端口和密码都保留。更新后网关起不来（或者更新前通、更新后不通），自动换回旧版。
+
+# 版本号比较：_ver_gt 1.14.2 1.13.9 → a 比 b 新返回 0
+_ver_gt() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    na = split(a, x, "."); nb = split(b, y, "."); n = (na > nb) ? na : nb
+    for (i = 1; i <= n; i++) { p = x[i] + 0; q = y[i] + 0; if (p > q) exit 0; if (p < q) exit 1 }
+    exit 1 }'
+}
+
+# 先换成临时文件再改名，正在运行的程序也能安全替换
+_put() { # _put <来源> <目标>
+  cp -p "$1" "$2.tmp" 2>/dev/null && mv -f "$2.tmp" "$2"
+}
+
+# 看看 sing-box 有没有新正式版；有就下载好放在 "$SB.new"（先不替换）。下载失败不要紧，继续用旧的。
+_sb_prepare_update() {
+  rm -f "$SB.new"
+  _cur=$("$SB" version 2>/dev/null | head -n 1 | sed -n 's/.*version \([0-9][0-9.]*\).*/\1/p')
+  _api=$(_get "https://api.github.com/repos/SagerNet/sing-box/releases/latest")
+  _ver=$(_sb_latest_ver "$_api")
+  case "$_ver" in
+    ''|*[!0-9.]*)
+      if [ -n "$_cur" ]; then info "查不到 sing-box 最新版本号（可能连不上 GitHub），继续用现在的 $_cur"; return 0; fi
+      _ver="$SB_FALLBACK_VER"; _api="" ;;
+  esac
+  if [ -n "$_cur" ] && ! _ver_gt "$_ver" "$_cur"; then
+    info "sing-box 已经是最新：$_cur"; return 0
+  fi
+  if _sb_get "$_ver" "$_api"; then
+    info "sing-box 新版 $_ver 已下载好（${_cur:-原来的跑不起来} → $_ver）"
+  else
+    rm -f "$SB.new"
+    [ -n "$_cur" ] || die "sing-box 下载失败，或在这台机器上跑不起来。请把上面的提示发出来。"
+    warn "sing-box 新版没下载下来，继续用现在的 $_cur"
+  fi
+  return 0
+}
+
+# 出问题时把更新前的文件放回去
+_update_rollback() { # _update_rollback <备份目录>
+  [ -f "$1/wg-luodi" ] && _put "$1/wg-luodi" "$WGL_CMD"
+  [ -f "$1/sing-box" ] && _put "$1/sing-box" "$SB"
+  [ -f "$1/gw.json" ] && _put "$1/gw.json" "$GW_JSON"
+  [ -f "$1/state" ] && _put "$1/state" "$STATE"
+  load_all
+}
+
+do_update() {
+  need_root
+  installed || { warn "这台服务器还没装过 wg-luodi，改为全新安装。"; WGL_FORCE_REINSTALL=1; do_install; return; }
+  load_all
+  detect_os; detect_init; detect_virt; detect_net
+  _sinit=$(st_get INIT); [ -n "$_sinit" ] && INIT="$_sinit"
+  _old_ver=$(st_get VERSION)
+  step "[更新] wg-luodi ${_old_ver:-旧版} → $WGL_VERSION（WireGuard 配置、端口、模式都保留，不用重新填）"
+  ensure_tools
+  ensure_singbox_present
+  _sb_prepare_update
+  _lock 60 || { rm -f "$SB.new"; die "另一个 wg-luodi 正在运行，请稍后再试。"; }
+  # 记下更新前的样子：隧道通不通、旧文件备份一份
+  _old_ok=""; gw_active && _old_ok=$(wg_exit_ip)
+  _bk="$WGL_DIR/update-backup"; rm -rf "$_bk"; mkdir -p "$_bk"; chmod 700 "$_bk"
+  [ -f "$WGL_CMD" ] && cp -p "$WGL_CMD" "$_bk/wg-luodi"
+  [ -x "$SB" ] && cp -p "$SB" "$_bk/sing-box"
+  [ -f "$GW_JSON" ] && cp -p "$GW_JSON" "$_bk/gw.json"
+  cp -p "$STATE" "$_bk/state"
+  # 1. 换上新版管理命令和 sing-box
+  self_install
+  [ -f "$SB.new" ] && mv -f "$SB.new" "$SB"
+  # 2. 用新版重新生成网关配置（先检查，通过了才换）和开机服务
+  if ! write_gw_json "$GW_JSON.new" || ! "$SB" check -c "$GW_JSON.new" >/dev/null 2>&1; then
+    rm -f "$GW_JSON.new"; _update_rollback "$_bk"; rm -rf "$_bk"
+    die "新版生成的网关配置没通过检查，已换回旧版，什么都没改。请把这条提示发出来。"
+  fi
+  mv -f "$GW_JSON.new" "$GW_JSON"; chmod 600 "$GW_JSON"
+  st_set VERSION "$WGL_VERSION"
+  install_services
+  # 3. 重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版
+  WIP=""
+  if ! start_and_check_gateway || { [ -z "$WIP" ] && [ -n "$_old_ok" ]; }; then
+    warn "更新后网关没测通（更新前是好的），自动换回旧版。"
+    _update_rollback "$_bk"; install_services; start_and_check_gateway; rm -rf "$_bk"
+    die "已换回旧版 ${_old_ver:-}，节点照常能用。请把上面的提示发出来。"
+  fi
+  # 4. 用新版重新检查节点（已经改好的不会重复改）
+  step "[节点] 重新检查走 WireGuard 的节点"
+  rm -f "$WGL_DIR/failed"
+  apply_all apply 1
+  _unlock
+  rm -rf "$_bk"
+  log "更新完成：${_old_ver:-?} → $WGL_VERSION"
+  step "更新好了！现在是 $WGL_VERSION 版"
+  say "  走 WireGuard 的端口：$(st_get PORTS)"
+  say "  WireGuard 出口 IP：${WIP:-（暂时没测通）}"
+  say "  以后管理直接输入：wg-luodi"
+}
+
+# 更新时如果 sing-box 不见了或跑不起来（比如被误删），先按正常流程装上
+ensure_singbox_present() {
+  [ -x "$SB" ] && _sb_ver_ok "$SB" && return 0
+  ensure_singbox
+}
+
+# wg-luodi update：下载 GitHub 上的最新版脚本，用它来更新
+do_self_update() {
+  need_root
+  installed || die "还没有安装。请先运行安装命令。"
+  _nf=$(mktemp "${TMPDIR:-/tmp}/wg-luodi-new.XXXXXX") || die "建不了临时文件"
+  info "下载最新版脚本…"
+  _gh_dl "$WGL_RAW_URL" "$_nf" || { rm -f "$_nf"; die "下载最新版失败（连不上 GitHub），请稍后再试。"; }
+  if ! grep -q '^WGL_VERSION=' "$_nf" || ! sh -n "$_nf" 2>/dev/null; then
+    rm -f "$_nf"; die "下载的脚本不完整，请稍后再试。"
+  fi
+  _nv=$(sed -n 's/^WGL_VERSION="\([^"]*\)".*/\1/p' "$_nf" | head -n 1)
+  info "GitHub 上的最新版：${_nv:-?}（现在装的：$(st_get VERSION)）"
+  sh "$_nf" apply-update; _rc=$?
+  rm -f "$_nf"
+  return $_rc
+}
+
 do_install() {
   need_root
   detect_os; detect_init; detect_virt; detect_net
   printf "\n${BOLD}wg-luodi：WireGuard 落地一键脚本（版本 %s）${NC}\n" "$WGL_VERSION"
   print_env
-  if installed && [ -t 0 ] && [ -z "$WG_CONF_FILE$WG_PORTS" ] && [ "${WGL_FORCE_REINSTALL:-0}" != 1 ]; then
+  # 已经装过、又没给新配置/新端口：直接更新到这个版本（配置、端口、模式都保留）
+  if installed && [ -z "$WG_CONF_FILE$WG_PORTS" ] && [ "${WGL_FORCE_REINSTALL:-0}" != 1 ]; then
     say ""
-    say "这台服务器已经装过 wg-luodi 了。"
-    say "  1) 打开管理菜单（看状态、加减端口、换配置）"
-    say "  2) 重新安装（重新粘贴配置、重新选端口）"
+    say "这台服务器已经装过 wg-luodi（版本 $(st_get VERSION)），现在自动更新到 $WGL_VERSION。"
+    do_update || return 1
+    [ -t 0 ] || return 0
+    say ""
+    say "  1) 完成，退出"
+    say "  2) 打开管理菜单（看状态、加减端口、换配置）"
+    say "  3) 重新安装（重新粘贴配置、重新选端口）"
     ask "请选择" 1
-    if [ "$ANS" != 2 ]; then self_install; do_menu; return; fi
+    case "$ANS" in
+      2) do_menu; return ;;
+      3) ;;
+      *) return 0 ;;
+    esac
   fi
   ensure_tools
   mkdir -p "$WGL_DIR"; chmod 700 "$WGL_DIR"
@@ -2054,6 +2201,7 @@ do_menu() {
     say "  7) 重新应用（节点被别的脚本重建后用）"
     say "  8) 重启网关"
     say "  9) 卸载（恢复所有节点、删除全部）"
+    say "  10) 更新 wg-luodi 到最新版（配置、端口都保留）"
     say "  0) 退出"
     ask "请选择" 1
     case "$ANS" in
@@ -2066,6 +2214,7 @@ do_menu() {
       7) ( do_reapply ) ;;
       8) ( do_restart ) ;;
       9) do_uninstall; return 0 ;;
+      10) ( do_self_update ) && say "  请重新输入 wg-luodi 打开新版菜单。"; return 0 ;;
       0|q|Q) return 0 ;;
       *) warn "没有这个选项" ;;
     esac
@@ -2084,6 +2233,7 @@ wg-luodi $WGL_VERSION —— WireGuard 落地管理
   wg-luodi mode auto|kernel|userspace   切换模式（userspace = 强制无网卡模式）
   wg-luodi reapply         重新给所有节点应用设置
   wg-luodi restart         重启网关
+  wg-luodi update          更新到 GitHub 上的最新版（配置、端口都保留）
   wg-luodi uninstall [-y]  卸载并恢复所有节点
 EOF
 }
@@ -2106,6 +2256,8 @@ main() {
     restart) need_root; do_restart ;;
     uninstall) do_uninstall "$2" ;;
     install) WGL_FORCE_REINSTALL=1; do_install ;;
+    update|upgrade) do_self_update ;;
+    apply-update) do_update ;;
     menu) do_menu ;;
     version|-v|--version) echo "wg-luodi $WGL_VERSION" ;;
     help|-h|--help) usage ;;

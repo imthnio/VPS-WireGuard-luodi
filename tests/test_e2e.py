@@ -18,7 +18,7 @@ import unittest
 import uuid
 from pathlib import Path
 
-from helpers import (BIN, Sandbox, box_ip, free_port, have_bins, hy2_yaml, make_node, reality_keypair,
+from helpers import (BIN, SCRIPT, Sandbox, box_ip, free_port, have_bins, hy2_yaml, make_node, reality_keypair,
                      sb_anytls_reality, wg_conf, wg_keypair, xray_ss, xray_vless_reality, xray_vmess_ws)
 
 ECHO = r'''
@@ -236,6 +236,44 @@ class E2E(unittest.TestCase):
         self.check_test_output(r.stdout, [p[1], p[3], p[4], p[6]], [p[2], p[5]])
         r = sb.run_cmd(["status"], timeout=200)
         self.assertIn("走 WireGuard ✔", r.stdout)
+
+        # ---- 9b. 更新：装过的机器再跑一次安装命令（不给配置/端口）= 自动更新，配置端口都保留 ----
+        snap = {k: v.read_bytes() for k, v in self.cfg.items()}
+        conf_before = (sb.etc / "wg.conf").read_bytes()
+        st_path = sb.etc / "state"
+        st_path.write_text(st_path.read_text().replace("VERSION=", "VERSION=0.9.") )   # 假装装的是旧版
+        r = sb.run([], timeout=400)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("自动更新到", r.stdout)
+        self.assertIn("更新好了", r.stdout)
+        self.assertIn("WireGuard 通了，出口 IP：%s" % WG_IP, r.stdout)
+        ver = [l for l in st_path.read_text().splitlines() if l.startswith("VERSION=")][0]
+        self.assertNotIn("0.9.", ver)
+        self.assertEqual(conf_before, (sb.etc / "wg.conf").read_bytes())
+        self.assertEqual(snap, {k: v.read_bytes() for k, v in self.cfg.items()})
+        self.assertFalse((sb.etc / "update-backup").exists())
+        r = sb.run_cmd(["test"], timeout=400)
+        self.check_test_output(r.stdout, [p[1], p[3], p[4], p[6]], [p[2], p[5]])
+
+        # ---- 9c. wg-luodi update：从网址下载最新版再更新（这里用本地文件代替 GitHub）----
+        r = sb.run_cmd(["update"], {"WGL_RAW_URL": "file://%s" % SCRIPT}, timeout=400)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("更新好了", r.stdout)
+        self.assertEqual(sb.cmd.read_bytes(), Path(SCRIPT).read_bytes())
+
+        # ---- 9d. 新版有问题（生成的网关配置不合格）：自动换回旧版，什么都不变 ----
+        bad = sb.tmp / "bad-wg-luodi.sh"
+        bad.write_text(Path(SCRIPT).read_text().replace('{ type: "socks", tag: "socks-in"', '{ type: "sockz", tag: "socks-in"')
+                       .replace('WGL_VERSION="', 'WGL_VERSION="9'))
+        cmd_before, gw_before, st_before = sb.cmd.read_bytes(), (sb.etc / "gw.json").read_bytes(), st_path.read_bytes()
+        r = sb.run_cmd(["update"], {"WGL_RAW_URL": "file://%s" % bad}, timeout=400)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("已换回旧版", r.stdout + r.stderr)
+        self.assertEqual(cmd_before, sb.cmd.read_bytes())
+        self.assertEqual(gw_before, (sb.etc / "gw.json").read_bytes())
+        self.assertEqual(st_before, st_path.read_bytes())
+        r = sb.run_cmd(["test"], timeout=400)
+        self.check_test_output(r.stdout, [p[1], p[3], p[4], p[6]], [p[2], p[5]])
 
         # ---- 10. 卸载：所有节点配置逐字节还原，文件全部删掉，节点还在正常跑 ----
         r = sb.run_cmd(["uninstall", "-y"], timeout=300)

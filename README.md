@@ -77,7 +77,12 @@ wg-luodi status        # 看握手时间、WireGuard 出口 IP、服务器自己
 | `wg-luodi mode auto\|kernel\|userspace` | 切换模式 |
 | `wg-luodi reapply` | 重新给所有节点应用设置（节点被别的脚本重建后用，平时巡检会自动做） |
 | `wg-luodi restart` | 重启网关 |
+| `wg-luodi update` | 更新到最新版。WireGuard 配置、端口、模式都保留；更新后网关起不来会自动换回旧版 |
 | `wg-luodi uninstall` | 卸载：节点配置逐字节还原，删除脚本装的所有东西 |
+
+**更新**：在已经装过的服务器上，再粘贴一次上面的一键安装命令就会自动更新到最新版（或者运行 `wg-luodi update`）。
+不用重新粘贴配置、不用重新选端口；sing-box 有新版也会一起换上。更新后网关起不来，会自动换回旧版。
+想换配置、换端口重新装：运行安装命令后选「重新安装」，或用下面的免交互安装。
 
 重复运行安装命令不会出错，也不会重复改配置。
 
