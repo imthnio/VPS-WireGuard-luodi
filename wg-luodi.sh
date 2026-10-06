@@ -374,6 +374,44 @@ _sb_ver_ok() { # _sb_ver_ok <程序>：版本 >= 1.12 返回 0
   [ "$1" -gt 1 ] || { [ "$1" -eq 1 ] && [ "$2" -ge 12 ]; }
 }
 
+# 是不是 musl 系统（Alpine 等）：有 musl 加载器，或 ldd 自报 musl。
+is_musl() {
+  ls /lib/ld-musl-* >/dev/null 2>&1 && return 0
+  ldd --version 2>&1 | grep -qi musl
+}
+
+# 下载一种 sing-box 包、核对 SHA256、解压，并确认能运行。成功就留下 "$SB.new"。
+_sb_fetch() { # _sb_fetch <版本> <包类型，如 amd64-musl> <发布接口内容>
+  _asset="sing-box-$1-linux-$2.tar.gz"
+  _tmp=$(mktemp -d "${TMPDIR:-/tmp}/wgl-sb.XXXXXX") || die "建不了临时目录"
+  info "下载 sing-box $1（$2）…"
+  if ! _gh_dl "https://github.com/SagerNet/sing-box/releases/download/v$1/${_asset}" "$_tmp/sb.tgz"; then
+    rm -rf "$_tmp"; warn "这个包没下载下来：${_asset}"; return 1
+  fi
+  # GitHub 的发布接口会给每个文件附上 sha256（digest），拿到了就核对
+  _want=$(printf '%s' "$3" | tr ',{}' '\n\n\n' | awk -v a="\"${_asset}\"" '
+      index($0, "\"name\"") && index($0, a) { hit = 1; next }
+      hit && index($0, "\"digest\"") { sub(/.*sha256:/, ""); gsub(/[" \r]/, ""); print tolower($0); exit }')
+  if [ -n "$_want" ]; then
+    _have=$(_sha256 "$_tmp/sb.tgz")
+    if [ -n "$_have" ] && [ "$_have" != "$_want" ]; then
+      rm -rf "$_tmp"; die "下载的 sing-box 和官方校验值对不上，已删除，不安装。请稍后重试。"
+    fi
+    info "SHA256 校验通过"
+  else
+    warn "没拿到官方校验值，改为只检查程序能不能运行"
+  fi
+  tar -xzf "$_tmp/sb.tgz" -C "$_tmp" 2>/dev/null || { rm -rf "$_tmp"; warn "安装包解压失败：${_asset}"; return 1; }
+  _bin=$(find "$_tmp" -type f -name sing-box | head -n 1)
+  [ -n "$_bin" ] || { rm -rf "$_tmp"; warn "安装包里没找到 sing-box：${_asset}"; return 1; }
+  cp -f "$_bin" "$SB.new" && chmod 755 "$SB.new"
+  rm -rf "$_tmp"
+  if ! _sb_ver_ok "$SB.new"; then
+    rm -f "$SB.new"; warn "这个包在本机跑不起来（多半是系统 C 库不匹配），换另一个包试试"; return 1
+  fi
+  return 0
+}
+
 ensure_singbox() {
   step "[准备] 网关程序 sing-box"
   mkdir -p "$WGL_LIB" && chmod 755 "$WGL_LIB"
@@ -394,30 +432,15 @@ ensure_singbox() {
   _api=$(_get "https://api.github.com/repos/SagerNet/sing-box/releases/latest")
   _ver=$(printf '%s' "$_api" | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -n 1)
   case "$_ver" in ''|*[!0-9.]*) _ver="$SB_FALLBACK_VER"; _api="" ;; esac
-  _asset="sing-box-${_ver}-linux-${ARCH}.tar.gz"
-  _tmp=$(mktemp -d "${TMPDIR:-/tmp}/wgl-sb.XXXXXX") || die "建不了临时目录"
-  info "下载 sing-box ${_ver}（${ARCH}）…"
-  _gh_dl "https://github.com/SagerNet/sing-box/releases/download/v${_ver}/${_asset}" "$_tmp/sb.tgz" \
-    || { rm -rf "$_tmp"; die "sing-box 下载失败。到 GitHub 的网络不通，稍后再试；纯 IPv6 机器请先给机器加一个 IPv4 出口（比如 WARP）。"; }
-  # GitHub 的发布接口会给每个文件附上 sha256（digest），拿到了就核对
-  _want=$(printf '%s' "$_api" | tr ',{}' '\n\n\n' | awk -v a="\"${_asset}\"" '
-      index($0, "\"name\"") && index($0, a) { hit = 1; next }
-      hit && index($0, "\"digest\"") { sub(/.*sha256:/, ""); gsub(/[" \r]/, ""); print tolower($0); exit }')
-  if [ -n "$_want" ]; then
-    _have=$(_sha256 "$_tmp/sb.tgz")
-    if [ -n "$_have" ] && [ "$_have" != "$_want" ]; then
-      rm -rf "$_tmp"; die "下载的 sing-box 和官方校验值对不上，已删除，不安装。请稍后重试。"
-    fi
-    info "SHA256 校验通过"
-  else
-    warn "没拿到官方校验值，改为只检查程序能不能运行"
-  fi
-  tar -xzf "$_tmp/sb.tgz" -C "$_tmp" 2>/dev/null || { rm -rf "$_tmp"; die "sing-box 安装包解压失败"; }
-  _bin=$(find "$_tmp" -type f -name sing-box | head -n 1)
-  [ -n "$_bin" ] || { rm -rf "$_tmp"; die "安装包里没找到 sing-box"; }
-  cp -f "$_bin" "$SB.new" && chmod 755 "$SB.new"
-  rm -rf "$_tmp"
-  _sb_ver_ok "$SB.new" || { rm -f "$SB.new"; die "下载的 sing-box 跑不起来（内存或磁盘太小？）"; }
+  # 系统用的是哪种 C 库：Alpine 用 musl，Debian/Ubuntu/CentOS 用 glibc。
+  # 官方 -musl 包是静态编译的（不依赖系统库），glibc 系统也能跑；普通包要 glibc 加载器，Alpine 上跑不了。
+  # 所以 musl 系统先试 -musl 包；glibc 系统先试普通包。第一个跑不起来就自动换另一个。
+  if is_musl; then _cands="${ARCH}-musl ${ARCH}"; else _cands="${ARCH} ${ARCH}-musl"; fi
+  _ok=0
+  for _flavor in $_cands; do
+    if _sb_fetch "$_ver" "$_flavor" "$_api"; then _ok=1; break; fi
+  done
+  [ "$_ok" = 1 ] || die "sing-box 下载失败，或下载的程序在这台机器上跑不起来（C 库不匹配）。请把上面的提示发出来。"
   mv -f "$SB.new" "$SB"
   info "sing-box 装好了：$("$SB" version | head -n 1)"
 }
