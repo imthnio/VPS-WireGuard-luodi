@@ -699,17 +699,11 @@ get_ports() {
     PORTS="$PORTS_OUT"; return 0
   fi
   [ -t 0 ] || die "现在不是交互终端，又没有给 WG_PORTS。"
-  _known=$(discover_nodes 2>/dev/null | while IFS='|' read -r _k _c _st _sn _b _al; do
-      _mp=$(cfg_main_port "$_k" "$_c"); [ -n "$_mp" ] && printf '%s(%s) ' "$_mp" "$(kind_cn "$_k")"; done)
   say ""
-  if [ -n "$_known" ]; then
-    say "这台服务器上现在找到的节点端口：$_known"
-  else
-    say "这台服务器上现在还没找到节点（以后在这些端口上搭的节点也会自动走 WireGuard）。"
-  fi
+  say "请输入你要用来搭节点的端口。之后你自己在这些端口上搭节点，节点会自动走 WireGuard。"
   _def=$(st_get PORTS)
   while :; do
-    ask "哪些端口要走 WireGuard？可以填多个，用空格隔开（例如 45192 50000）" "$_def"
+    ask "要设置的端口是？可以填多个，用空格隔开（例如 45192 50000）" "$_def"
     if parse_ports "$ANS"; then PORTS="$PORTS_OUT"; break; fi
     err "$PARSE_ERR，请重新输入。"
   done
