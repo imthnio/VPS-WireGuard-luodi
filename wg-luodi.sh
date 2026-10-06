@@ -62,7 +62,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.1"
+WGL_VERSION="1.1.2"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -342,7 +342,6 @@ _sha256() {
 ensure_tools() {
   step "[准备] 检查需要的小工具"
   _need=""
-  _has curl || _has wget || _need="$_need curl"
   _has curl || _need="$_need curl"
   _has tar || _need="$_need tar"
   _has gzip || _need="$_need gzip"
@@ -617,7 +616,7 @@ read_conf_paste() { # read_conf_paste <保存到>
     _t=$(printf '%s' "$_l" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [ "$_n" = 0 ] && [ -z "$_t" ]; then continue; fi
     if [ "$_n" = 0 ]; then
-      case "$_t" in /*|./*|~/*)
+      case "$_t" in /*|./*|\~/*)
         _fp=$(printf '%s' "$_t" | sed "s#^~/#$HOME/#")
         if [ -f "$_fp" ]; then tr -d '\r' < "$_fp" > "$_out"; info "已读取文件 $_fp"; return 0; fi
         warn "找不到文件 $_fp，请直接粘贴配置内容。"; continue ;;
@@ -1270,8 +1269,10 @@ svc_restart() { # svc_restart <服务类型> <服务名>：重启并确认起来
   esac
 }
 
-# 同一个配置一小时内被别的程序改回去 5 次以上，就不再自动改它（防止和别的脚本“打架”反复重启节点）
+# 巡检时：同一个配置一小时内被别的程序改回去 5 次以上，就不再自动改它（防止和别的脚本“打架”反复重启节点）。
+# 只在巡检（wg-luodi check）里计数；你手动加减端口、重新应用不算。
 _flap_ok() {
+  [ "${_IN_CHECK:-0}" = 1 ] || return 0
   _ff="$WGL_DIR/backup/$(_bkey "$1").flap"; _now=$(date +%s)
   _cnt=0; _t0=$_now
   [ -f "$_ff" ] && read -r _t0 _cnt < "$_ff"
@@ -1357,7 +1358,6 @@ apply_one() {
 
 # 对所有找到的节点做一遍 apply_one，并打印结果
 apply_all() { # apply_all <apply|strip> <是否重启 1|0>
-  _APPLY_FAIL=0
   _list=$(discover_nodes)
   if [ -z "$_list" ]; then
     say "  这台服务器上暂时没有找到节点。以后在这些端口上搭的节点会自动走 WireGuard。"
@@ -1609,7 +1609,7 @@ do_status() {
   esac
   say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
   say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
-  if gw_active; then say "  网关服务：运行中"; else say "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）"; fi
+  if gw_active; then say "  网关服务：运行中"; else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
   if [ "$MODE" = kernel ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     if [ -n "$_hs" ] && [ "$_hs" != 0 ]; then say "  最近握手：$(( $(date +%s) - _hs )) 秒前（3 分钟内都正常）"
@@ -2044,6 +2044,7 @@ do_check() {
   find_jq || exit 0
   load_all
   INIT=$(st_get INIT)
+  _IN_CHECK=1
   _lock 0 || exit 0
   if gw_active; then
     if [ "$MODE" = kernel ] && ! kernel_ensure; then log "网卡不见了，重启网关"; gw_restart; fi
@@ -2179,6 +2180,7 @@ do_uninstall() {
   fi
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
   step "[1/3] 恢复节点配置"
+  rm -f "$WGL_DIR/failed"
   apply_all strip 1
   _bad=0
   discover_nodes | while IFS='|' read -r k c st sn b al; do
