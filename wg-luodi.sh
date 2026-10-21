@@ -61,6 +61,9 @@
 #       要靠服务商把外网 IPv6 “转发”进来（NAT66）。NAT 小鸡常见这种情况。
 # 入口 IP 和出口 IP 是两回事：客户端填服务器的 IPv4 还是 IPv6，只决定“从哪个门进来”；
 #       进来以后，走 WireGuard 的端口一律从 WireGuard 出去，回给客户端的包照旧走服务器自己的网络。
+# 只听 IPv4 的节点：配置里写 0.0.0.0 的 Hysteria2（还有个别 sing-box）只收 IPv4，客户端填 IPv6 就连不上。
+#       本脚本发现走 WireGuard 的端口是这种情况、而服务器又能用 IPv6 时，会自动把它改成双栈
+#       （Hysteria2 写 :端口，Xray / sing-box 写 ::），改之前先备份，节点起不来就换回原样。
 # ============================================================
 
 # shellcheck disable=SC1111,SC2046
@@ -72,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.3"
+WGL_VERSION="1.1.4"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1158,6 +1161,22 @@ _rules_add() {
   return 0
 }
 
+# 不打断流量地把专用路由补齐：路由用 replace（原地替换），规则只在缺的时候才加。
+# 更新时网关不重启，就用它代替“删了重建”。
+_rules_sync() {
+  for _f in 4 6; do
+    if [ "$_f" = 4 ]; then _on="$WG_HAS4"; else _on="$WG_HAS6"; fi
+    if [ "$_on" = 1 ]; then
+      ip -$_f route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
+    else
+      ip -$_f route replace unreachable default table "$WGL_TABLE" 2>/dev/null
+    fi
+    ip -$_f rule show 2>/dev/null | grep -q "lookup $WGL_TABLE" \
+      || ip -$_f rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
+  done
+  return 0
+}
+
 kernel_up() {
   _has modprobe && modprobe wireguard >/dev/null 2>&1
   ip link del dev "$WGL_IFACE" >/dev/null 2>&1
@@ -1467,6 +1486,103 @@ apply_all() { # apply_all <apply|strip> <是否重启 1|0>
   done
 }
 
+# ---------- 17b. 只听 IPv4 的节点改成双栈 ----------
+# 走 WireGuard 的端口上，节点要是只听 IPv4（Hysteria2 写了 0.0.0.0:端口、sing-box 写了 0.0.0.0），
+# 客户端填服务器的 IPv6 就连不进来。服务器能用 IPv6 时，自动把它改成双栈：
+#   Hysteria2：listen 0.0.0.0:端口 → :端口；Xray / sing-box：这些端口的入站 listen "0.0.0.0" → "::"。
+# 只改“端口正在 IPv4 上听、IPv6 上没人听”的节点（停着的节点不碰）。改之前备份，改完重启这个节点，
+# 确认 IPv6 上也在听了才算成功；起不来就换回原配置再重启，并记下来，配置没变就不再试。
+
+# 服务器能不能“听” IPv6：网卡上有全局 IPv6（公网的、fd 开头的内网地址都算：NAT 小鸡的外网 IPv6
+# 转发进来时落在内网地址上），IPv6 没被关掉，系统也没设 bindv6only=1（那样 :: 收不到 IPv4）。
+_v6_listen_ok() {
+  [ -r /proc/net/if_inet6 ] || return 1
+  [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = 1 ] && return 1
+  [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)" = 1 ] && return 1
+  awk -v skip="$WGL_IFACE" '$4 == "00" && $6 != "lo" && $6 != skip { f = 1 } END { exit !f }' /proc/net/if_inet6 2>/dev/null
+}
+
+# 生成“改成双栈”的配置：v6_dual_cfg <类型> <配置> <端口…> <输出>；没有能改的地方返回 1
+v6_dual_cfg() {
+  case "$1" in
+    hysteria)
+      grep -Eq "^listen:[[:space:]]*[\"']?0\.0\.0\.0:" "$2" || return 1
+      # 整行重写成 listen: ":端口"（带引号，冒号开头的值不加引号有的 YAML 读不了）
+      awk -v q="'" '/^listen:/ && !done {
+          v = $0; sub(/\r$/, "", v); sub(/^listen:[[:space:]]*/, "", v); sub(/[[:space:]]+#.*$/, "", v)
+          gsub("^[\"" q "]|[\"" q "]$", "", v); sub(/^0\.0\.0\.0:/, ":", v)
+          print "listen: \"" v "\""; done = 1; next }
+        { print }' "$2" > "$4" || return 1 ;;
+    xray|sing-box)
+      if [ "$1" = xray ]; then _pk=port; else _pk=listen_port; fi
+      "$JQ" --argjson ports "$(_ports_json "$3")" --arg pk "$_pk" '
+        ($ports | map(tostring)) as $p
+        | .inbounds |= map(
+            ((.[$pk] // "") | tostring) as $x
+            | if ([$p[] | select(. == $x)] | length) > 0 and (.listen // "") == "0.0.0.0" then .listen = "::" else . end)' \
+        "$2" > "$4" 2>/dev/null || return 1
+      same_cfg "$1" "$2" "$4" && return 1 ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+_v6_failed() { [ -f "$WGL_DIR/v6failed" ] && grep -qF "$(_sha256 "$1") $1" "$WGL_DIR/v6failed"; }
+_v6_mark()   { mkdir -p "$WGL_DIR"; echo "$(_sha256 "$1") $1" >> "$WGL_DIR/v6failed"; }
+
+v6_fix_all() {
+  _v6_listen_ok || return 0
+  discover_nodes | while IFS='|' read -r k c st sn b al; do
+    [ -n "$k" ] && [ "$k" != panel ] && [ -f "$c" ] || continue
+    _wp=$(cfg_wg_ports "$k" "$c" "$al"); [ -n "$_wp" ] || continue
+    _need=""
+    for _p in $_wp; do [ "$(port_fams "$_p")" = v4 ] && _need="$_need $_p"; done
+    [ -n "$_need" ] || continue
+    _v6_failed "$c" && continue
+    _label="$(kind_cn "$k") 端口$_need"
+    _n="$c.wgl-v6"; [ "$k" != hysteria ] && _n="$c.wgl-v6.json"
+    if ! v6_dual_cfg "$k" "$c" "$_need" "$_n"; then
+      rm -f "$_n"; _v6_mark "$c"
+      warn "$_label 只听 IPv4，但配置里的监听地址不是 0.0.0.0，没法自动改。想让 IPv6 也能连，请手动把监听地址改成 ::（Hysteria2 写 :端口）"
+      log "双栈：没法自动改 $c"
+      continue
+    fi
+    validate_cfg "$k" "$_n" "$b"
+    case $? in 0|3) ;; *)
+      rm -f "$_n"; _v6_mark "$c"
+      warn "$_label：改成双栈的配置没通过检查，原配置没动：$VAL_ERR"
+      continue ;;
+    esac
+    mkdir -p "$WGL_DIR/backup"; chmod 700 "$WGL_DIR/backup"
+    _vb="$WGL_DIR/backup/$(_bkey "$c").v6bak"
+    cp -p "$c" "$_vb" || { rm -f "$_n"; continue; }
+    put_cfg "$c" "$_n"; rm -f "$_n"
+    svc_restart "$st" "$sn"; _rc=$?
+    _ok=0
+    if [ "$_rc" = 0 ]; then
+      _i=0
+      while [ "$_i" -lt 10 ]; do
+        _ok=1; for _p in $_need; do case "$(port_fams "$_p")" in *v6*) ;; *) _ok=0 ;; esac; done
+        [ "$_ok" = 1 ] && break
+        _i=$((_i + 1)); sleep 1
+      done
+    fi
+    if [ "$_ok" = 1 ]; then
+      info "$_label：原来只听 IPv4（客户端填 IPv6 连不上），已改成同时听 IPv4 和 IPv6，并重启了这个节点。原配置备份在 $_vb"
+      log "双栈：已改 $c（$_need）"
+    else
+      cat "$_vb" > "$c"
+      [ "$_rc" = 3 ] || svc_restart "$st" "$sn"
+      _v6_mark "$c"
+      if [ "$_rc" = 3 ]; then
+        warn "$_label 只听 IPv4。找不到这个节点的服务、没法自动重启，所以没改。想让 IPv6 也能连，请手动把监听地址改成 :: 再重启它"
+      else
+        err "$_label：改成双栈后节点没起来（或 IPv6 上还是没在听），已换回原来的配置并重启"
+      fi
+      log "双栈：失败已还原 $c"
+    fi
+  done
+}
+
 # 节点启动时的钩子（VPS-dajianjiedian 的节点服务启动前会调用 wg-luodi hook 编号）。
 # 只改配置、不重启（服务马上就要启动）。任何情况下都返回 0，绝不拖累节点启动。
 do_hook() {
@@ -1618,6 +1734,12 @@ EOF
   esac
 }
 
+# 开机服务文件的“指纹”：更新前后一比，就知道服务有没有变（没变就不用重启网关）
+_svc_sum() {
+  cat "$WGL_SD/wg-luodi.service" "$WGL_SD/wg-luodi-watch.service" "$WGL_SD/wg-luodi-watch.timer" \
+      "$WGL_INITD/wg-luodi" "$WGL_INITD/wg-luodi-watch" "$WGL_LIB/watch-loop" 2>/dev/null | cksum
+}
+
 remove_services() {
   case "$INIT" in
     systemd)
@@ -1718,7 +1840,8 @@ v6_report() {
       "v4 v6") say "    端口 $_p：IPv4、IPv6 都在监听 ✔" ;;
       v6) if [ "$_v6only" = 1 ]; then say "    端口 $_p：只在 IPv6 上监听（系统设置了 bindv6only=1），填 IPv4 可能连不上"
           else say "    端口 $_p：IPv4、IPv6 都在监听 ✔（双栈）"; fi ;;
-      v4) say "    端口 $_p：只在 IPv4 上监听 ✘ 填 IPv6 连不上。请把这个节点的监听地址改成 :: （或者不写），然后重启这个节点" ;;
+      v4) if _v6_listen_ok; then say "    端口 $_p：只在 IPv4 上监听 ✘ 填 IPv6 连不上（自动改成双栈没成功，看上面的提示；可以运行 wg-luodi reapply 再试）"
+          else say "    端口 $_p：只在 IPv4 上监听（这台服务器现在用不了 IPv6，不用改）"; fi ;;
       *) say "    端口 $_p：现在没有程序在监听（节点还没搭好或没启动）" ;;
     esac
   done
@@ -2056,26 +2179,37 @@ do_update() {
   cp -p "$STATE" "$_bk/state"
   # 1. 换上新版管理命令和 sing-box
   self_install
-  [ -f "$SB.new" ] && mv -f "$SB.new" "$SB"
+  _gw_changed=0
+  [ -f "$SB.new" ] && { mv -f "$SB.new" "$SB"; _gw_changed=1; }
   # 2. 用新版重新生成网关配置（先检查，通过了才换）和开机服务
   if ! write_gw_json "$GW_JSON.new" || ! "$SB" check -c "$GW_JSON.new" >/dev/null 2>&1; then
     rm -f "$GW_JSON.new"; _update_rollback "$_bk"; rm -rf "$_bk"
     die "新版生成的网关配置没通过检查，已换回旧版，什么都没改。请把这条提示发出来。"
   fi
+  cmp -s "$GW_JSON.new" "$GW_JSON" || _gw_changed=1
   mv -f "$GW_JSON.new" "$GW_JSON"; chmod 600 "$GW_JSON"
   st_set VERSION "$WGL_VERSION"
+  _svc_before=$(_svc_sum)
   install_services
-  # 3. 重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版
+  [ "$(_svc_sum)" = "$_svc_before" ] || _gw_changed=1
+  # 3. 网关程序、网关配置、开机服务都没变，而且网关现在是通的：不重启网关，走 WireGuard 的节点一秒都不断。
+  #    内核网卡模式只把专用路由规则补齐（缺了才加，不删不重建）。
+  #    有变化才重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版。
   WIP=""
-  if ! start_and_check_gateway || { [ -z "$WIP" ] && [ -n "$_old_ok" ]; }; then
+  if [ "$_gw_changed" = 0 ] && [ -n "$_old_ok" ]; then
+    [ "$MODE" = kernel ] && _rules_sync
+    WIP="$_old_ok"
+    info "网关没有变化，不用重启（WireGuard 出口 IP：$WIP）"
+  elif ! start_and_check_gateway || { [ -z "$WIP" ] && [ -n "$_old_ok" ]; }; then
     warn "更新后网关没测通（更新前是好的），自动换回旧版。"
     _update_rollback "$_bk"; install_services; start_and_check_gateway; rm -rf "$_bk"
     die "已换回旧版 ${_old_ver:-}，节点照常能用。请把上面的提示发出来。"
   fi
-  # 4. 用新版重新检查节点（已经改好的不会重复改）
+  # 4. 用新版重新检查节点（已经改好的不会重复改），再把只听 IPv4 的节点改成双栈
   step "[节点] 重新检查走 WireGuard 的节点"
-  rm -f "$WGL_DIR/failed"
+  rm -f "$WGL_DIR/failed" "$WGL_DIR/v6failed"
   apply_all apply 1
+  v6_fix_all
   _unlock
   rm -rf "$_bk"
   log "更新完成：${_old_ver:-?} → $WGL_VERSION"
@@ -2155,8 +2289,9 @@ do_install() {
   install_services
   start_and_check_gateway || { _unlock; die "网关启动失败，节点配置没有改动。"; }
   step "[节点] 给走 WireGuard 的端口改路由"
-  rm -f "$WGL_DIR/failed"
+  rm -f "$WGL_DIR/failed" "$WGL_DIR/v6failed"
   apply_all apply 1
+  v6_fix_all
   _unlock
   log "安装完成：模式 $MODE，端口 $PORTS"
   step "装好了！"
@@ -2195,6 +2330,7 @@ do_check() {
     log "网关没在运行，重新启动"; gw_restart
   fi
   apply_all apply 1 >/dev/null 2>&1
+  v6_fix_all >/dev/null 2>&1
   _unlock
   exit 0
 }
@@ -2224,6 +2360,7 @@ _ports_change() { # _ports_change add|del 端口…
   rm -f "$WGL_DIR/failed"
   step "更新节点"
   apply_all apply 1
+  v6_fix_all
   _unlock
   info "现在走 WireGuard 的端口：$PORTS"
 }
@@ -2298,10 +2435,11 @@ do_mode() { # do_mode auto|kernel|userspace
 do_reapply() {
   load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
-  rm -f "$WGL_DIR/failed" "$WGL_DIR"/backup/*.flap
+  rm -f "$WGL_DIR/failed" "$WGL_DIR/v6failed" "$WGL_DIR"/backup/*.flap
   gw_active || start_and_check_gateway
   step "重新检查所有节点"
   apply_all apply 1
+  v6_fix_all
   _unlock
 }
 
