@@ -51,6 +51,16 @@
 #       用错了程序会报 not found 跑不起来，所以 Alpine 上下载 sing-box 的 -musl 版（静态编译，哪里都能跑）。
 # 更新：换上新版脚本和新版 sing-box，重新生成网关配置；你的 WireGuard 配置和端口原样保留。
 # 巡检：每 2 分钟自动检查一次的小任务。别的脚本重建了节点、或者路由规则被清掉，它会自动补回去。
+# 终端 / /dev/tty：你打字的那个窗口。脚本提问时总是从这里读你的回答，
+#       就算是用 curl … | sh 这种“管道”方式运行（这时普通输入是脚本内容，不是键盘）也一样。
+# 终端设置（stty）：终端怎么处理回车、要不要显示你打的字。个别程序会把它改乱，
+#       之后按回车没反应。本脚本每次提问前都会先把终端设置恢复正常。
+# IPv4 / IPv6：两种 IP 地址。IPv4 像 23.94.180.2，IPv6 像 2001:470::1。
+#       双栈：服务器两种都有。节点程序监听 [::] 时，IPv4 和 IPv6 的客户端都能连进来。
+# 内网 IPv6（ULA，fd 开头）：只在服务商内部用的 IPv6，比如 fd66::5。外面的人连不到它，
+#       要靠服务商把外网 IPv6 “转发”进来（NAT66）。NAT 小鸡常见这种情况。
+# 入口 IP 和出口 IP 是两回事：客户端填服务器的 IPv4 还是 IPv6，只决定“从哪个门进来”；
+#       进来以后，走 WireGuard 的端口一律从 WireGuard 出去，回给客户端的包照旧走服务器自己的网络。
 # ============================================================
 
 # shellcheck disable=SC1111,SC2046
@@ -62,7 +72,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.2"
+WGL_VERSION="1.1.3"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -121,10 +131,33 @@ _to() { # _to <秒> 命令…
 }
 
 # ---------- 3. 提问小工具 ----------
+# 键盘输入一律从终端读：用 curl … | sh 运行时，普通输入是脚本本身，不是键盘，
+# 这时改从 /dev/tty（你打字的窗口）一行一行地读（TTY_IN 记着从哪里读，空 = 普通输入就是键盘）。
+# 开始时记下终端原来的设置；每次提问前恢复一下，防止被别的程序改乱后“按回车没反应”。
+TTY_IN=""; _TTY_SAVED=""
+tty_init() {
+  if [ ! -t 0 ] && (: < /dev/tty) 2>/dev/null; then TTY_IN=/dev/tty; fi
+  _has stty && _can_ask && _TTY_SAVED=$(_stty -g 2>/dev/null)
+  return 0
+}
+_can_ask() { [ -t 0 ] || [ -n "$TTY_IN" ]; }   # 能不能向你提问（有没有键盘可读）
+_stty() { if [ -n "$TTY_IN" ]; then stty "$@" < "$TTY_IN"; else stty "$@"; fi; }
+_readline() { # _readline <变量名>：从键盘读一行
+  if [ -n "$TTY_IN" ]; then IFS= read -r "$1" < "$TTY_IN"; else IFS= read -r "$1"; fi
+}
+tty_fix() {
+  _has stty && _can_ask || return 0
+  if [ -n "$_TTY_SAVED" ]; then _stty "$_TTY_SAVED" 2>/dev/null || _stty sane 2>/dev/null; fi
+  # 不管原来怎样，回车要能换行、要能看到自己打的字、要按行读
+  _stty icrnl icanon echo 2>/dev/null
+  return 0
+}
+
 # 一次只问一个问题。直接回车就用方括号里的推荐值。回答存到变量 ANS。
 ask() { # ask "问题" "默认值"
+  tty_fix
   if [ -n "$2" ]; then printf "%s [直接回车 = %s]: " "$1" "$2"; else printf "%s: " "$1"; fi
-  if ! IFS= read -r ANS; then
+  if ! _readline ANS; then
     printf "\n"
     die "没有读到你的回答，已停止。请重新运行脚本。"
   fi
@@ -261,6 +294,35 @@ detect_net() {
   # 有的 LXC/OpenVZ 小鸡没有 default 路由，但有 0.0.0.0/1 这种拆开的路由，也算有 IPv4
   if [ "$HAS_V4" = 0 ] && _has ip && ip -4 route get 1.1.1.1 >/dev/null 2>&1; then HAS_V4=1; fi
   if [ "$HAS_V6" = 0 ] && _has ip && ip -6 route get 2606:4700:4700::1111 >/dev/null 2>&1; then HAS_V6=1; fi
+  # 网卡上的 IPv6 是什么样的：public = 公网地址；ula = 内网地址（fd 开头，外网要靠服务商 NAT66 转发进来）
+  V6_LOCAL=$(v6_local_addr); V6_KIND=none
+  case "$V6_LOCAL" in
+    '') V6_KIND=none ;;
+    [fF][cCdD]*) V6_KIND=ula ;;
+    *) V6_KIND=public ;;
+  esac
+}
+
+# 网卡上第一个“全局”IPv6 地址（跳过 lo、本脚本的 wg-luodi 网卡、fe80 这种本地链路地址）。
+# 直接读 /proc/net/if_inet6，busybox 也能用。打印成常见的缩写形式（fd66::5）。
+v6_local_addr() {
+  [ -r /proc/net/if_inet6 ] || return 0
+  awk -v skip="$WGL_IFACE" '
+    $4 == "00" && $6 != "lo" && $6 != skip && tolower(substr($1, 1, 4)) != "fe80" {
+      a = tolower($1)
+      for (i = 1; i <= 8; i++) { g[i] = substr(a, i * 4 - 3, 4); sub(/^0+/, "", g[i]); if (g[i] == "") g[i] = "0" }
+      # 找最长的一串连续 0，缩成 ::
+      bs = 0; bl = 0; cs = 0; cl = 0
+      for (i = 1; i <= 8; i++) {
+        if (g[i] == "0") { if (cl == 0) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } } else cl = 0
+      }
+      out = ""
+      for (i = 1; i <= 8; i++) {
+        if (bl >= 2 && i == bs) { out = out "::"; i += bl - 1; continue }
+        out = out ((out == "" || out ~ /:$/) ? "" : ":") g[i]
+      }
+      print out; exit
+    }' /proc/net/if_inet6 2>/dev/null
 }
 
 print_env() {
@@ -270,28 +332,29 @@ print_env() {
   say "  机器类型：  ${VIRT_CN}"
   say "  TUN 设备：  $([ "$HAS_TUN" = 1 ] && echo 有 || echo '没有（不影响，本脚本不需要 TUN）')"
   say "  WG 内核模块：$(case $HAS_KMOD in 1) echo 已加载 ;; 2) echo '有（还没加载）' ;; *) echo '没检测到（可以用无网卡模式）' ;; esac)"
-  say "  网络：      IPv4 $([ "$HAS_V4" = 1 ] && echo 有 || echo 没有)，IPv6 $([ "$HAS_V6" = 1 ] && echo 有 || echo 没有)"
+  say "  网络：      IPv4 $([ "$HAS_V4" = 1 ] && echo 有 || echo 没有)，IPv6 $([ "$HAS_V6" = 1 ] && echo 有 || echo 没有)$(case "$V6_KIND" in ula) echo "（网卡上是内网 IPv6 $V6_LOCAL，外网 IPv6 靠服务商转发）" ;; public) echo "（$V6_LOCAL）" ;; esac)"
 }
 
 # ---------- 7. 装需要的小工具 ----------
 # jq（改 JSON 配置用）、curl（下载和测出口 IP 用）；内核网卡模式还要 wg 和完整的 ip 命令。
 # 已经有的就不装。apt 只在第一次需要时 update 一次。
+# 所有后台命令的输入都接到 /dev/null：不让它们碰你的终端（防止终端设置被改乱、你打的字被抢走）。
 _APT_UPDATED=0
 pkg_install() { # pkg_install 包名…
   [ -n "$PKG" ] || return 1
   [ "${WGL_NO_PKG:-0}" = 1 ] && return 1
   case "$PKG" in
-    apk) _to 300 apk add --no-cache "$@" >/dev/null 2>&1 ;;
+    apk) _to 300 apk add --no-cache "$@" </dev/null >/dev/null 2>&1 ;;
     apt)
       if [ "$_APT_UPDATED" = 0 ]; then
-        DEBIAN_FRONTEND=noninteractive _to 300 apt-get update -qq >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive _to 300 apt-get update -qq </dev/null >/dev/null 2>&1
         _APT_UPDATED=1
       fi
-      DEBIAN_FRONTEND=noninteractive _to 600 apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
-    dnf) _to 600 dnf install -y -q "$@" >/dev/null 2>&1 ;;
-    yum) _to 600 yum install -y -q "$@" >/dev/null 2>&1 ;;
-    pacman) _to 600 pacman -Sy --noconfirm --needed "$@" >/dev/null 2>&1 ;;
-    zypper) _to 600 zypper -n -q install "$@" >/dev/null 2>&1 ;;
+      DEBIAN_FRONTEND=noninteractive _to 600 apt-get install -y -qq "$@" </dev/null >/dev/null 2>&1 ;;
+    dnf) _to 600 dnf install -y -q "$@" </dev/null >/dev/null 2>&1 ;;
+    yum) _to 600 yum install -y -q "$@" </dev/null >/dev/null 2>&1 ;;
+    pacman) _to 600 pacman -Sy --noconfirm --needed "$@" </dev/null >/dev/null 2>&1 ;;
+    zypper) _to 600 zypper -n -q install "$@" </dev/null >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac
 }
@@ -610,8 +673,9 @@ _cidr_list() { # _cidr_list "a,b" -> 空格分隔
 # 也可以直接输入一个文件路径（比如 /root/wg0.conf）。
 read_conf_paste() { # read_conf_paste <保存到>
   _out="$1"; : > "$_out"; chmod 600 "$_out"
+  tty_fix
   _f_i=0; _f_pk=0; _f_p=0; _f_pub=0; _f_ep=0; _f_al=0; _n=0
-  while IFS= read -r _l || [ -n "$_l" ]; do
+  while _readline _l || [ -n "$_l" ]; do
     _l=$(printf '%s' "$_l" | tr -d '\r')
     _t=$(printf '%s' "$_l" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     if [ "$_n" = 0 ] && [ -z "$_t" ]; then continue; fi
@@ -650,7 +714,7 @@ get_conf() { # get_conf <保存到>
     parse_conf "$_dst" || die "WireGuard 配置有问题：$PARSE_ERR"
     return 0
   fi
-  [ -t 0 ] || die "现在不是交互终端，又没有给 WG_CONF_FILE。请用：WG_CONF_FILE=/root/wg.conf WG_PORTS=\"端口\" sh wg-luodi.sh"
+  _can_ask || die "现在不是交互终端，又没有给 WG_CONF_FILE。请用：WG_CONF_FILE=/root/wg.conf WG_PORTS=\"端口\" sh wg-luodi.sh"
   _try=0
   while :; do
     _try=$((_try + 1))
@@ -697,7 +761,7 @@ get_ports() {
     parse_ports "$WG_PORTS" || die "WG_PORTS 不对：$PARSE_ERR"
     PORTS="$PORTS_OUT"; return 0
   fi
-  [ -t 0 ] || die "现在不是交互终端，又没有给 WG_PORTS。"
+  _can_ask || die "现在不是交互终端，又没有给 WG_PORTS。"
   say ""
   say "请输入你要用来搭节点的端口。之后你自己在这些端口上搭节点，节点会自动走 WireGuard。"
   _def=$(st_get PORTS)
@@ -982,6 +1046,20 @@ port_listening() { # port_listening <端口> <tcp|udp>：直接读 /proc，busyb
   done
   return 1
 }
+# 这个端口在哪种 IP 上有程序监听：打印 "v4"、"v6"、"v4 v6" 或空。
+# 节点程序监听 [::]（Xray / sing-box / Hysteria2 写 0.0.0.0 或不写，默认也是这样）时只出现在 tcp6/udp6 里，
+# 这种“双栈”监听 IPv4 和 IPv6 的客户端都能连进来。
+port_fams() { # port_fams <端口>
+  _hex=$(printf '%04X' "$1"); _r4=""; _r6=""
+  for _f in tcp udp tcp6 udp6; do
+    [ -r "/proc/net/$_f" ] || continue
+    case "$_f" in udp*) _stt=07 ;; *) _stt=0A ;; esac
+    if awk -v port="$_hex" -v st="$_stt" 'NR > 1 { n = split($2, a, ":"); if (toupper(a[n]) == port && toupper($4) == st) f = 1 } END { exit !f }' "/proc/net/$_f"; then
+      case "$_f" in *6) _r6=v6 ;; *) _r4=v4 ;; esac
+    fi
+  done
+  printf '%s' "$_r4${_r4:+${_r6:+ }}$_r6"
+}
 
 write_gw_json() { # write_gw_json <输出文件>
   _mtu="$WG_MTU"
@@ -1014,7 +1092,13 @@ write_gw_json() { # write_gw_json <输出文件>
         { type: "direct", tag: "dns-in", listen: "127.0.0.1", listen_port: $dp }
       ],
       route: {
-        rules: [ { inbound: [ "dns-in" ], action: "hijack-dns" } ],
+        rules: (
+          [ { inbound: [ "dns-in" ], action: "hijack-dns" } ]
+          # 隧道只支持一种 IP 时，另一种 IP 的目标直接拒绝（客户端会马上改用能用的那种），不会走服务器自己的 IP
+          + (if $strat == "ipv4_only" then [ { ip_cidr: [ "::/0" ], action: "reject" } ]
+             elif $strat == "ipv6_only" then [ { ip_cidr: [ "0.0.0.0/0" ], action: "reject" } ]
+             else [] end)
+        ),
         final: (if $mode == "kernel" then "wg-out" else "wg" end),
         default_domain_resolver: { server: "wg-dns", strategy: $strat }
       }
@@ -1057,15 +1141,20 @@ _wg_setconf_file() { # 生成 wg 命令认识的精简配置（去掉 Address、
   printf 'AllowedIPs = %s\nEndpoint = %s\nPersistentKeepalive = %s\n' "$WG_ALLOWED" "$_epfmt" "$WG_KA"
 }
 
+# IPv4 和 IPv6 各一份：隧道支持这种 IP，专用表里就是“全部走 wg-luodi 网卡”；
+# 隧道不支持（比如落地只给了 IPv4），专用表里就是“此路不通”（unreachable），
+# 让带标记的包马上失败，绝不会从服务器自己的 IP 偷偷出去。没带标记的包（SSH、节点回给客户端的包）完全不受影响。
 _rules_add() {
-  ip -4 route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
-  while ip -4 rule del fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null; do :; done
-  ip -4 rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
-  if [ "$WG_HAS6" = 1 ]; then
-    ip -6 route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
-    while ip -6 rule del fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null; do :; done
-    ip -6 rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
-  fi
+  for _f in 4 6; do
+    if [ "$_f" = 4 ]; then _on="$WG_HAS4"; else _on="$WG_HAS6"; fi
+    if [ "$_on" = 1 ]; then
+      ip -$_f route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
+    else
+      ip -$_f route replace unreachable default table "$WGL_TABLE" 2>/dev/null
+    fi
+    while ip -$_f rule del fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null; do :; done
+    ip -$_f rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
+  done
   return 0
 }
 
@@ -1102,6 +1191,8 @@ kernel_ensure() {
   ip link show dev "$WGL_IFACE" >/dev/null 2>&1 || return 1
   if ! ip -4 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "专用路由规则丢了，已补回"; fi
   if ! ip -4 route show table "$WGL_TABLE" 2>/dev/null | grep -q default; then _rules_add; log "专用路由表丢了，已补回"; fi
+  # IPv6 那一份（机器有 IPv6 才查；没有 IPv6 的内核会直接报错，不用管）
+  if [ -e /proc/net/if_inet6 ] && ! ip -6 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "IPv6 专用路由规则丢了，已补回"; fi
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
   if [ "$WG_EP_KIND" = name ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
@@ -1229,11 +1320,11 @@ validate_cfg() { # validate_cfg <类型> <配置> <程序>
   case "$1" in
     xray)
       [ -x "$3" ] || return 3
-      VAL_ERR=$(_to 30 "$3" -test -config "$2" 2>&1) && return 0
+      VAL_ERR=$(_to 30 "$3" -test -config "$2" </dev/null 2>&1) && return 0
       VAL_ERR=$(printf '%s' "$VAL_ERR" | grep -iv 'reading config' | tail -n 3 | tr '\n' ' '); return 1 ;;
     sing-box)
       [ -x "$3" ] || return 3
-      VAL_ERR=$(_to 30 "$3" check -c "$2" 2>&1) && return 0
+      VAL_ERR=$(_to 30 "$3" check -c "$2" </dev/null 2>&1) && return 0
       VAL_ERR=$(printf '%s' "$VAL_ERR" | tail -n 3 | tr '\n' ' '); return 1 ;;
     *) return 3 ;;
   esac
@@ -1258,13 +1349,13 @@ reg_add() { # 记下改过的配置，卸载时一个不漏
 svc_restart() { # svc_restart <服务类型> <服务名>：重启并确认起来了。返回 3 = 没法自动重启
   case "$1" in
     systemd)
-      systemctl restart "$2" >/dev/null 2>&1
+      systemctl restart "$2" </dev/null >/dev/null 2>&1
       sleep 3
       systemctl is-active --quiet "$2" ;;
     openrc)
-      rc-service "$2" restart >/dev/null 2>&1
+      rc-service "$2" restart </dev/null >/dev/null 2>&1
       sleep 3
-      rc-service "$2" status >/dev/null 2>&1 ;;
+      rc-service "$2" status </dev/null >/dev/null 2>&1 ;;
     *) return 3 ;;
   esac
 }
@@ -1463,7 +1554,7 @@ EOF
       systemctl daemon-reload >/dev/null 2>&1
       systemctl enable wg-luodi.service >/dev/null 2>&1
       systemctl enable wg-luodi-watch.timer >/dev/null 2>&1
-      systemctl restart wg-luodi-watch.timer >/dev/null 2>&1
+      systemctl restart wg-luodi-watch.timer </dev/null >/dev/null 2>&1
       ;;
     openrc)
       cat > "$WGL_INITD/wg-luodi" <<EOF
@@ -1519,7 +1610,7 @@ EOF
       chmod 755 "$WGL_INITD/wg-luodi" "$WGL_INITD/wg-luodi-watch"
       rc-update add wg-luodi default >/dev/null 2>&1
       rc-update add wg-luodi-watch default >/dev/null 2>&1
-      rc-service wg-luodi-watch restart >/dev/null 2>&1 || rc-service wg-luodi-watch start >/dev/null 2>&1
+      rc-service wg-luodi-watch restart </dev/null >/dev/null 2>&1 || rc-service wg-luodi-watch start </dev/null >/dev/null 2>&1
       ;;
     *)
       warn "没有 systemd，也没有 OpenRC：网关先在后台跑起来，但服务器重启后要手动运行一次：wg-luodi restart"
@@ -1557,12 +1648,12 @@ _gw_kill() {
 # 启动 / 重启网关
 gw_restart() {
   case "$INIT" in
-    systemd) systemctl restart wg-luodi.service >/dev/null 2>&1 ;;
-    openrc) rc-service wg-luodi restart >/dev/null 2>&1 || { rc-service wg-luodi zap >/dev/null 2>&1; rc-service wg-luodi start >/dev/null 2>&1; } ;;
+    systemd) systemctl restart wg-luodi.service </dev/null >/dev/null 2>&1 ;;
+    openrc) rc-service wg-luodi restart </dev/null >/dev/null 2>&1 || { rc-service wg-luodi zap </dev/null >/dev/null 2>&1; rc-service wg-luodi start </dev/null >/dev/null 2>&1; } ;;
     *)
       _gw_kill; [ "$MODE" = kernel ] && kernel_down
       [ "$MODE" = kernel ] && { kernel_up || return 1; }
-      nohup "$SB" run -c "$GW_JSON" >> "$WGL_DIR/gw.log" 2>&1 &
+      nohup "$SB" run -c "$GW_JSON" </dev/null >> "$WGL_DIR/gw.log" 2>&1 &
       echo $! > "$WGL_DIR/gw.pid" ;;
   esac
 }
@@ -1597,6 +1688,47 @@ wg_exit_ip() {
   ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)"
 }
 server_ip() { ip_via -4 || ip_via -6; }
+# 服务器的外网 IPv4 / IPv6（客户端填的“服务器地址”）。每种最多等十几秒，没有就打印空。
+pub_ip() { # pub_ip <4|6>
+  _has curl || return 1
+  for _u in https://api64.ipify.org https://icanhazip.com; do
+    _r=$(_to 10 curl -"$1" -fsS -A 'Mozilla/5.0' --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null | tr -d ' \r\n')
+    if [ "$1" = 4 ] && _is_ip4 "$_r"; then printf '%s' "$_r"; return 0; fi
+    if [ "$1" = 6 ] && _is_ip6 "$_r"; then printf '%s' "$_r"; return 0; fi
+  done
+  return 1
+}
+
+# ---------- 19b. IPv4 / IPv6 入口检查 ----------
+# 说人话告诉你：客户端填服务器的 IPv4 还是 IPv6 都能不能连进来。
+# 设计：客户端从哪种 IP 连进来都行（入口）；进来以后，走 WireGuard 的端口一律从 WireGuard 出去（出口）；
+# 回给客户端的包照旧走服务器自己的网络（没有标记，不进 WireGuard），所以 IPv6 连进来也能正常回包。
+v6_report() {
+  [ -n "$V6_KIND" ] || detect_net
+  _p4=$(pub_ip 4); _p6=""
+  [ "$HAS_V6" = 1 ] && _p6=$(pub_ip 6)
+  say "  客户端里“服务器地址”可以填："
+  say "    IPv4：${_p4:-（没测到外网 IPv4）}"
+  if [ -n "$_p6" ]; then say "    IPv6：$_p6"
+  elif [ "$HAS_V6" = 1 ]; then say "    IPv6：（服务器有 IPv6，但没测到外网 IPv6 地址，IPv6 可能出不去也进不来）"
+  else say "    IPv6：（这台服务器没有 IPv6）"; fi
+  _v6only=0; [ -r /proc/sys/net/ipv6/bindv6only ] && [ "$(cat /proc/sys/net/ipv6/bindv6only)" = 1 ] && _v6only=1
+  for _p in $PORTS; do
+    case "$(port_fams "$_p")" in
+      "v4 v6") say "    端口 $_p：IPv4、IPv6 都在监听 ✔" ;;
+      v6) if [ "$_v6only" = 1 ]; then say "    端口 $_p：只在 IPv6 上监听（系统设置了 bindv6only=1），填 IPv4 可能连不上"
+          else say "    端口 $_p：IPv4、IPv6 都在监听 ✔（双栈）"; fi ;;
+      v4) say "    端口 $_p：只在 IPv4 上监听 ✘ 填 IPv6 连不上。请把这个节点的监听地址改成 :: （或者不写），然后重启这个节点" ;;
+      *) say "    端口 $_p：现在没有程序在监听（节点还没搭好或没启动）" ;;
+    esac
+  done
+  if [ -n "$_p6" ] && [ "$V6_KIND" = ula ]; then
+    say "  提示：这台服务器网卡上的 IPv6 是内网地址 $V6_LOCAL，外网 IPv6 $_p6 是服务商转发过来的。"
+    say "        填 IPv6 能不能连上，还要看服务商有没有把这个端口的 IPv6 也转发进来。"
+    say "        如果连“不走 WireGuard 的节点”填 IPv6 也连不上，就是服务商没转发，脚本改不了，客户端请填 IPv4。"
+  fi
+  say "  不管填 IPv4 还是 IPv6 连进来，走 WireGuard 的端口出口都是 WireGuard 的 IP。"
+}
 
 # ---------- 20. 状态 ----------
 do_status() {
@@ -1616,6 +1748,8 @@ do_status() {
     else say "  最近握手：还没有握手（落地机没回应：检查配置、或服务器能不能连到落地机的 UDP 端口）"; fi
   fi
   say "  走 WireGuard 的端口：$PORTS"
+  detect_net
+  v6_report
   say ""
   say "  正在测出口 IP（要十几秒）…"
   _sip=$(server_ip); _wip=$(wg_exit_ip)
@@ -1655,7 +1789,7 @@ _b64url_dec() { # base64url -> 原始字节
 }
 x25519_pub() { # REALITY 私钥 -> 公钥（优先用 xray x25519 -i；没有 xray 就用 openssl）
   if [ -x "$XN_BIN_DIR/xray" ]; then
-    _o=$("$XN_BIN_DIR/xray" x25519 -i "$1" 2>/dev/null)
+    _o=$("$XN_BIN_DIR/xray" x25519 -i "$1" </dev/null 2>/dev/null)
     _pk=$(printf '%s\n' "$_o" | sed -n 's/^Public key: *//p; s/^PublicKey: *//p; s/^Password[^:]*: *//p' | head -n 1 | tr -d ' \r')
     [ -n "$_pk" ] && { printf '%s' "$_pk"; return 0; }
   fi
@@ -1667,7 +1801,7 @@ x25519_pub() { # REALITY 私钥 -> 公钥（优先用 xray x25519 -i；没有 xr
 }
 
 # 根据服务器端配置生成 sing-box 客户端的出站（只支持本脚本常见的几种节点）
-client_outbound() { # client_outbound <类型> <配置> <端口>
+client_outbound() { # client_outbound <类型> <配置> <端口> [连哪个地址，默认 127.0.0.1；::1 = 从 IPv6 连进去]
   case "$1" in
     xray)
       _in=$("$JQ" -c --arg p "$3" '[.inbounds[]? | select((.port | tostring) == $p)][0]' "$2")
@@ -1679,7 +1813,7 @@ client_outbound() { # client_outbound <类型> <配置> <端口>
         _pub=$(x25519_pub "$(printf '%s' "$_in" | "$JQ" -r '.streamSettings.realitySettings.privateKey')") || return 1
         [ -n "$_pub" ] || return 1
       fi
-      printf '%s' "$_in" | "$JQ" -c --arg pub "$_pub" --argjson port "$3" '
+      printf '%s' "$_in" | "$JQ" -c --arg pub "$_pub" --argjson port "$3" --arg srv "${4:-127.0.0.1}" '
         def tls:
           if .streamSettings.security == "reality" then
             {tls: {enabled: true, server_name: .streamSettings.realitySettings.serverNames[0],
@@ -1690,7 +1824,7 @@ client_outbound() { # client_outbound <类型> <配置> <端口>
         def transport:
           if (.streamSettings.network // "tcp") == "ws" then {transport: {type: "ws", path: (.streamSettings.wsSettings.path // "/")}}
           else {} end;
-        {server: "127.0.0.1", server_port: $port} +
+        {server: $srv, server_port: $port} +
         (if .protocol == "vless" then {type: "vless", uuid: .settings.clients[0].id} + (if (.settings.clients[0].flow // "") != "" then {flow: .settings.clients[0].flow} else {} end)
          elif .protocol == "trojan" then {type: "trojan", password: .settings.clients[0].password}
          elif .protocol == "vmess" then {type: "vmess", uuid: .settings.clients[0].id, security: "auto"}
@@ -1708,7 +1842,7 @@ client_outbound() { # client_outbound <类型> <配置> <端口>
         _pub=$(x25519_pub "$(printf '%s' "$_in" | "$JQ" -r '.tls.reality.private_key')") || return 1
         [ -n "$_pub" ] || return 1
       fi
-      printf '%s' "$_in" | "$JQ" -c --arg pub "$_pub" --argjson port "$3" '
+      printf '%s' "$_in" | "$JQ" -c --arg pub "$_pub" --argjson port "$3" --arg srv "${4:-127.0.0.1}" '
         def tls:
           if (.tls.enabled // false) | not then {}
           elif (.tls.reality.enabled // false) then
@@ -1716,7 +1850,7 @@ client_outbound() { # client_outbound <类型> <配置> <端口>
                    utls: {enabled: true, fingerprint: "chrome"},
                    reality: {enabled: true, public_key: $pub, short_id: ((.tls.reality.short_id // [""]) | if type == "array" then .[0] else . end)}}}
           else {tls: ({enabled: true, insecure: true, server_name: (.tls.server_name // "localhost")} + (if .tls.alpn then {alpn: .tls.alpn} else {} end))} end;
-        {server: "127.0.0.1", server_port: $port} +
+        {server: $srv, server_port: $port} +
         (if .type == "vless" then {type: "vless", uuid: .users[0].uuid} + (if (.users[0].flow // "") != "" then {flow: .users[0].flow} else {} end)
          elif .type == "trojan" then {type: "trojan", password: .users[0].password}
          elif .type == "vmess" then {type: "vmess", uuid: .users[0].uuid}
@@ -1737,8 +1871,8 @@ client_outbound() { # client_outbound <类型> <配置> <端口>
         [ -f "$_crt" ] && _sn=$(openssl x509 -in "$_crt" -noout -text 2>/dev/null | grep -o 'DNS:[^,]*' | head -n 1 | sed 's/DNS://')
       fi
       [ -n "$_pw" ] || return 1
-      "$JQ" -nc --arg pw "$_pw" --arg ob "$_ob" --arg sn "${_sn:-www.samsung.com}" --argjson port "$3" '
-        {type: "hysteria2", server: "127.0.0.1", server_port: $port, password: $pw,
+      "$JQ" -nc --arg pw "$_pw" --arg ob "$_ob" --arg sn "${_sn:-www.samsung.com}" --argjson port "$3" --arg srv "${4:-127.0.0.1}" '
+        {type: "hysteria2", server: $srv, server_port: $port, password: $pw,
          tls: {enabled: true, insecure: true, server_name: $sn}}
         + (if $ob != "" then {obfs: {type: "salamander", password: $ob}} else {} end)' ;;
   esac
@@ -1760,22 +1894,29 @@ do_test() { # do_test [端口]
       [ -n "$1" ] && [ "$1" != "$_p" ] && continue
       _wp=$(cfg_wg_ports "$k" "$c" "$al")
       _should="直连"; case " $_wp " in *" $_p "*) _should="WireGuard" ;; esac
-      _ob=$(client_outbound "$k" "$c" "$_p")
-      if [ -z "$_ob" ]; then say "  - $(kind_cn "$k") 端口 $_p：这种节点脚本测不了，请用手机客户端连上它，打开 ip.sb 看。"; continue; fi
-      _lp=$(pick_free_port "$_p")
-      "$JQ" -n --argjson ob "$_ob" --argjson lp "$_lp" \
-        '{log: {level: "error"}, inbounds: [{type: "mixed", listen: "127.0.0.1", listen_port: $lp}], outbounds: [$ob + {tag: "node"}]}' > "$_tdir/c.json"
-      "$SB" run -c "$_tdir/c.json" > "$_tdir/c.log" 2>&1 &
-      _cp=$!
-      _i=0; while [ "$_i" -lt 10 ] && ! port_listening "$_lp" tcp; do _i=$((_i + 1)); sleep 1; done
-      _got=$(ip_via -x "http://127.0.0.1:$_lp")
-      kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
-      if [ -z "$_got" ]; then
-        _res="${RED}没测通${NC}（节点没响应或这条路不通）"
-      elif [ "$_should" = WireGuard ] && [ "$_got" = "$_wip" ]; then _res="${GREEN}出口 $_got = WireGuard ✔${NC}"
-      elif [ "$_should" = 直连 ] && [ "$_got" != "$_wip" ]; then _res="${GREEN}出口 $_got = 服务器自己的 IP ✔${NC}"
-      else _res="${RED}出口 $_got，和预期（$_should）不符 ✘${NC}"; fi
-      printf '  - %s 端口 %s（应该走%s）：%b\n' "$(kind_cn "$k")" "$_p" "$_should" "$_res"
+      # 先从 IPv4（127.0.0.1）连进节点测一次；节点也在 IPv6 上监听的话，再从 IPv6（::1）连进去测一次，
+      # 确认“客户端填 IPv6 连进来”时出口也对。
+      _srvs="127.0.0.1"
+      case "$(port_fams "$_p")" in *v6*) grep -q '^0\{31\}1 ' /proc/net/if_inet6 2>/dev/null && _srvs="127.0.0.1 ::1" ;; esac
+      for _srv in $_srvs; do
+        if [ "$_srv" = "::1" ]; then _via="IPv6 连入"; else _via="IPv4 连入"; fi
+        _ob=$(client_outbound "$k" "$c" "$_p" "$_srv")
+        if [ -z "$_ob" ]; then say "  - $(kind_cn "$k") 端口 $_p：这种节点脚本测不了，请用手机客户端连上它，打开 ip.sb 看。"; break; fi
+        _lp=$(pick_free_port "$_p")
+        "$JQ" -n --argjson ob "$_ob" --argjson lp "$_lp" \
+          '{log: {level: "error"}, inbounds: [{type: "mixed", listen: "127.0.0.1", listen_port: $lp}], outbounds: [$ob + {tag: "node"}]}' > "$_tdir/c.json"
+        "$SB" run -c "$_tdir/c.json" </dev/null > "$_tdir/c.log" 2>&1 &
+        _cp=$!
+        _i=0; while [ "$_i" -lt 10 ] && ! port_listening "$_lp" tcp; do _i=$((_i + 1)); sleep 1; done
+        _got=$(ip_via -x "http://127.0.0.1:$_lp")
+        kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
+        if [ -z "$_got" ]; then
+          _res="${RED}没测通${NC}（节点没响应或这条路不通）"
+        elif [ "$_should" = WireGuard ] && [ "$_got" = "$_wip" ]; then _res="${GREEN}出口 $_got = WireGuard ✔${NC}"
+        elif [ "$_should" = 直连 ] && [ "$_got" != "$_wip" ]; then _res="${GREEN}出口 $_got = 服务器自己的 IP ✔${NC}"
+        else _res="${RED}出口 $_got，和预期（$_should）不符 ✘${NC}"; fi
+        printf '  - %s 端口 %s，%s（应该走%s）：%b\n' "$(kind_cn "$k")" "$_p" "$_via" "$_should" "$_res"
+      done
     done
   done < "$_tdir/list"
   rm -rf "$_tdir"
@@ -1941,6 +2082,7 @@ do_update() {
   step "更新好了！现在是 $WGL_VERSION 版"
   say "  走 WireGuard 的端口：$(st_get PORTS)"
   say "  WireGuard 出口 IP：${WIP:-（暂时没测通）}"
+  v6_report
   say "  以后管理直接输入：wg-luodi"
 }
 
@@ -1977,7 +2119,7 @@ do_install() {
     say ""
     say "这台服务器已经装过 wg-luodi（版本 $(st_get VERSION)），现在自动更新到 $WGL_VERSION。"
     do_update || return 1
-    [ -t 0 ] || return 0
+    _can_ask || return 0
     say ""
     say "  1) 完成，退出"
     say "  2) 打开管理菜单（看状态、加减端口、换配置）"
@@ -2020,6 +2162,7 @@ do_install() {
   step "装好了！"
   say "  走 WireGuard 的端口：$PORTS"
   say "  WireGuard 出口 IP：${WIP:-（暂时没测通）}"
+  v6_report
   say ""
   say "  怎么确认生效："
   say "  1. 手机/电脑客户端连上“端口在上面列表里”的节点，浏览器打开 ip.sb，显示的应该是 WireGuard 出口 IP；"
@@ -2260,6 +2403,8 @@ EOF
 # ---------- 25. 入口 ----------
 # 没有参数：装好了就打开菜单（用 wg-luodi 命令时），没装就开始安装。
 main() {
+  # 会提问的命令：先找到键盘在哪（管道运行时改从 /dev/tty 读），并记下终端设置
+  case "${1:-}" in hook|check|up|down|apply-update|version|-v|--version|help|-h|--help) ;; *) tty_init ;; esac
   case "${1:-}" in
     hook) shift; do_hook "$@" ;;
     check) do_check ;;
