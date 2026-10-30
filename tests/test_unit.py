@@ -171,6 +171,14 @@ class EpMarkTest(unittest.TestCase):
         out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1"))         # 没法确认大包：借来的标记不用
         self.assertEqual(out[0], "off", r.stderr)
 
+    def test_probe_works_for_ipv6_only_tunnels(self):
+        (self.sb.etc / "state").write_text("")
+        r = self.sb.source("MODE=kernel; WG_HAS4=0; WG_HAS6=1; _mtu_probe; echo rc=$?; st_get EP_MTU",
+                           {"FAKE_PING_MAX": "1300", "WGL_L2TP_DIR": str(self.sb.tmp / "none")})
+        self.assertEqual(r.stdout.split(), ["rc=0", "51889:1340"], r.stderr)   # 1292 数据 + 48 包头
+        self.assertIn("ping -6 ", self.sb.fake_log())
+        self.assertIn("2606:4700:4700::1111", self.sb.fake_log())
+
     def test_pick_own_mark_without_ping_works_as_before(self):
         out, r = self.pick({"FAKE_NO_PING": "1"})
         self.assertEqual(out[0], "51889", r.stderr)
