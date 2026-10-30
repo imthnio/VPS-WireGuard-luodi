@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.11"
+WGL_VERSION="1.1.12"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1182,7 +1182,8 @@ _wg_setconf_file() { # _wg_setconf_file <标记|off>：生成 wg 命令认识的
   fi
   case "$_epip" in *:*) _epfmt="[$_epip]:$WG_EP_PORT" ;; *) _epfmt="$_epip:$WG_EP_PORT" ;; esac
   printf '[Interface]\nPrivateKey = %s\n' "$WG_PRIV"
-  [ "${1:-off}" != off ] && printf 'FwMark = %s\n' "$1"
+  # 不打标记时也要明写 off：setconf 不写这一项就保留网卡上原来的标记（试路时上一个候选的）
+  printf 'FwMark = %s\n' "${1:-off}"
   printf '\n[Peer]\nPublicKey = %s\n' "$WG_PUB"
   [ -n "$WG_PSK" ] && printf 'PresharedKey = %s\n' "$WG_PSK"
   printf 'AllowedIPs = %s\nEndpoint = %s\nPersistentKeepalive = %s\n' "$WG_ALLOWED" "$_epfmt" "$WG_KA"
