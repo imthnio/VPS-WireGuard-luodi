@@ -1,0 +1,21 @@
+name: wg-luodi checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  shell-and-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck jq iputils-ping
+      - name: Shell checks
+        run: |
+          sh -n wg-luodi.sh
+          shellcheck -S warning wg-luodi.sh
+      - name: Unit tests (dash as sh)
+        working-directory: tests
+        run: python3 -m unittest -v test_unit test_e2e
