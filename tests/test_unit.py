@@ -185,6 +185,14 @@ class EpMarkTest(unittest.TestCase):
         out, r = self.pick({"FAKE_PING_MAX": "100"})                    # 自己的标记：大包确定过不去也换路
         self.assertEqual(out[0], "off", r.stderr)
 
+    def test_l2tp_note(self):
+        r = self.sb.source('_l2tp_note', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
+        self.assertEqual(r.stdout, "")
+        env = self.l2tp()
+        self.assertIn("L2TP-VPS", self.sb.source('_l2tp_note', env).stdout)
+        (Path(env["WGL_L2TP_DIR"]) / "disabled").write_text("")             # L2TP 执行过 recover：不提
+        self.assertEqual(self.sb.source('_l2tp_note', env).stdout, "")
+
     def test_picking_marker(self):
         r = self.sb.source('echo $$ > "$WGL_DIR/picking"; gw_picking && echo YES')
         self.assertEqual(r.stdout.strip(), "YES", r.stderr)              # 选路的进程还活着：正在启动

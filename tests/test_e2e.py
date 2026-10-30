@@ -115,7 +115,7 @@ class E2E(unittest.TestCase):
         for p in wg_ports:
             self.assertRegex(out, r"端口 %d（应该走WireGuard）：.*%s = WireGuard ✔" % (p, WG_IP), out)
         for p in direct_ports:
-            self.assertRegex(out, r"端口 %d（应该走直连）：.*%s = 服务器自己的 IP ✔" % (p, SERVER_IP), out)
+            self.assertRegex(out, r"端口 %d（应该走直连）：.*%s = 服务器平时的出口 IP ✔" % (p, SERVER_IP), out)
         self.assertNotIn("✘", out)
         self.assertNotIn("没测通", out)
 

@@ -2001,6 +2001,11 @@ wg_exit_ip() {
   ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)"
 }
 server_ip() { ip_via -4 || ip_via -6; }
+# 服务器装了 L2TP-VPS（而且没关掉）时，“平时的出口”是 L2TP 的 IP，不是服务器自己的 IP，提示一句免得看糊涂。
+_l2tp_note() {
+  [ -f "$WGL_L2TP_DIR/v2-owned" ] && [ ! -f "$WGL_L2TP_DIR/disabled" ] || return 0
+  printf '\n  （这台服务器装了 L2TP-VPS：不走 WireGuard 的流量走 L2TP；L2TP 排除端口上的节点用服务器自己的 IP）'
+}
 # 服务器的外网 IPv4 / IPv6（客户端填的“服务器地址”）。每种最多等十几秒，没有就打印空。
 pub_ip() { # pub_ip <4|6>
   _has curl || return 1
@@ -2074,7 +2079,7 @@ do_status() {
   else
   say "  正在测出口 IP（要十几秒）…"
   _sip=$(server_ip); _wip=$(wg_exit_ip)
-  say "  服务器自己的 IP：${_sip:-没测出来}"
+  say "  服务器平时的出口 IP（不走 WireGuard 的流量）：${_sip:-没测出来}"$(_l2tp_note)
   if [ -n "$_wip" ]; then
     say "  WireGuard 出口 IP：$_wip"
     if [ "$_wip" != "$_sip" ]; then info "WireGuard 是通的，出口 IP 和服务器 IP 不一样，分流正常。"
@@ -2090,7 +2095,7 @@ do_status() {
     [ -n "$k" ] || continue
     if [ "$k" = panel ]; then say "  - 面板配置 $c：面板会覆盖改动，脚本不改。请在面板里给这个入站加一个 SOCKS5 出站：127.0.0.1:$(st_get SOCKS_PORT)，用户名 $(st_get SOCKS_USER)，密码 $(st_get SOCKS_PASS)"; continue; fi
     _mp=$(cfg_main_port "$k" "$c"); _wp=$(cfg_wg_ports "$k" "$c" "$al")
-    _ok="直连（服务器自己的 IP）"
+    _ok="不走 WireGuard（用服务器平时的出口）"
     if [ -n "$_wp" ]; then
       if [ "$k" = hysteria ]; then grep -q '^# wg-luodi begin' "$c" && _ok="走 WireGuard ✔" || _ok="应该走 WireGuard，但还没改好 ✘"
       else "$JQ" -e '[.outbounds[]? | select(.tag == "wg-luodi")] | length > 0' "$c" >/dev/null 2>&1 && _ok="走 WireGuard ✔" || _ok="应该走 WireGuard，但还没改好 ✘"; fi
@@ -2205,7 +2210,7 @@ do_test() { # do_test [端口]
   INIT=$(st_get INIT)
   step "逐个节点实测出口 IP（每个节点要几秒）"
   _sip=$(server_ip); _wip=$(wg_exit_ip)
-  say "  服务器自己的 IP：${_sip:-没测出来}"
+  say "  服务器平时的出口 IP（不走 WireGuard 的流量）：${_sip:-没测出来}"$(_l2tp_note)
   say "  WireGuard 出口 IP：${_wip:-没测出来（WireGuard 不通）}"
   say ""
   _tdir=$(mktemp -d "${TMPDIR:-/tmp}/wgl-test.XXXXXX") || die "建不了临时目录"
@@ -2235,7 +2240,7 @@ do_test() { # do_test [端口]
         if [ -z "$_got" ]; then
           _res="${RED}没测通${NC}（节点没响应或这条路不通）"
         elif [ "$_should" = WireGuard ] && [ "$_got" = "$_wip" ]; then _res="${GREEN}出口 $_got = WireGuard ✔${NC}"
-        elif [ "$_should" = 直连 ] && [ "$_got" != "$_wip" ]; then _res="${GREEN}出口 $_got = 服务器自己的 IP ✔${NC}"
+        elif [ "$_should" = 直连 ] && [ "$_got" != "$_wip" ]; then _res="${GREEN}出口 $_got = 服务器平时的出口 IP ✔${NC}"
         else _res="${RED}出口 $_got，和预期（$_should）不符 ✘${NC}"; fi
         printf '  - %s 端口 %s，%s（应该走%s）：%b\n' "$(kind_cn "$k")" "$_p" "$_via" "$_should" "$_res"
       done
@@ -2507,7 +2512,7 @@ do_install() {
   say ""
   say "  怎么确认生效："
   say "  1. 手机/电脑客户端连上“端口在上面列表里”的节点，浏览器打开 ip.sb，显示的应该是 WireGuard 出口 IP；"
-  say "  2. 连其它端口的节点打开 ip.sb，显示的还是服务器自己的 IP；"
+  say "  2. 连其它端口的节点打开 ip.sb，显示的还是服务器平时的出口 IP；"
   say "  3. 或者直接在服务器上运行：wg-luodi test   （逐个节点自动实测）"
   say ""
   say "  以后管理：输入 wg-luodi 打开中文菜单。以后在这些端口新搭的节点，会自动走 WireGuard。"
