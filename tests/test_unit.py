@@ -234,6 +234,16 @@ class EpMarkTest(unittest.TestCase):
         self.assertIn("落地机本身的带宽", v("10", "11", "9", "100"))        # 怎么测都慢：落地机
         self.assertIn("差不多", v("90", "95", "88", "100"))
         self.assertIn("完全下载不了", v("", "", "", "100"))
+        self.assertIn("比平时的出口快很多", v("243.8", "301.7", "260.4", "55.2"))   # 实测：WireGuard 比 L2TP 快 5 倍
+
+    def test_client_address_on_l2tp_server_is_the_servers_own(self):
+        # 普通 curl 在 L2TP 服务器上走 L2TP，查到的是 L2TP 出口；要用 l2tp-fetch 账号走服务器自己的网络查
+        stub = ('_to() { shift; "$@"; }; id() { [ "$1" = l2tp-fetch ]; }; '
+                'su() { echo 198.51.100.7; }; curl() { echo 81.187.228.68; }; ')
+        r = self.sb.source(stub + "pub_ip 4", self.l2tp())
+        self.assertEqual(r.stdout, "198.51.100.7", r.stderr)
+        r = self.sb.source(stub + "pub_ip 4", {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
+        self.assertEqual(r.stdout, "81.187.228.68", r.stderr)      # 没装 L2TP：照旧
 
     def test_l2tp_note(self):
         r = self.sb.source('_l2tp_note', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})

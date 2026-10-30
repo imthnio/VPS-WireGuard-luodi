@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.18"
+WGL_VERSION="1.1.19"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -2062,6 +2062,9 @@ _speed_verdict() { # _speed_verdict <raw> <raw4> <gw> <direct>
     if (r != "" && g != "" && g < r * 0.7) {
       print "直接用 WireGuard 网卡快、经网关慢：拖慢的是本机网关程序这一段，多半是 CPU 不够（看上面的负载）"; exit }
     base = (r != "") ? r : g
+    if (d != "" && base != "" && base > d * 1.5) {
+      print "服务器上 WireGuard 比平时的出口快很多，WireGuard 和网关这一段都没问题。"
+      print "    如果手机上用走 WireGuard 的节点还是觉得慢，慢在手机到服务器这一段或节点程序本身（两种节点共用），和 WireGuard 无关"; exit }
     if (r4 != "" && base != "" && r4 > base * 1.5) {
       print "单个连接跑不满、4 个连接加起来快很多：是服务器到落地机这段的延迟或丢包限制了每个连接的速度，"
       print "    落地机本身带宽还有余量。网页、测速软件开多个连接时会快一些，脚本这边没法再提速"; exit }
@@ -2072,15 +2075,25 @@ _speed_verdict() { # _speed_verdict <raw> <raw4> <gw> <direct>
   }'
 }
 # 服务器装了 L2TP-VPS（而且没关掉）时，“平时的出口”是 L2TP 的 IP，不是服务器自己的 IP，提示一句免得看糊涂。
+_l2tp_active() { [ -f "$WGL_L2TP_DIR/v2-owned" ] && [ ! -f "$WGL_L2TP_DIR/disabled" ]; }
 _l2tp_note() {
-  [ -f "$WGL_L2TP_DIR/v2-owned" ] && [ ! -f "$WGL_L2TP_DIR/disabled" ] || return 0
+  _l2tp_active || return 0
   printf '\n  （这台服务器装了 L2TP-VPS：不走 WireGuard 的流量走 L2TP；L2TP 排除端口上的节点用服务器自己的 IP）'
 }
 # 服务器的外网 IPv4 / IPv6（客户端填的“服务器地址”）。每种最多等十几秒，没有就打印空。
+# 装了 L2TP-VPS 时，普通的 curl 走 L2TP，查到的是 L2TP 的出口 IP。客户端填它连不进来（L2TP 只出站），
+# 所以改用 L2TP-VPS 的维护账号 l2tp-fetch 去查：L2TP-VPS 只允许这个账号走服务器自己的网络访问 HTTPS，
+# 查到的就是服务器自己的公网 IP（NAT 小鸡也一样，比读网卡地址准）。
 pub_ip() { # pub_ip <4|6>
   _has curl || return 1
+  _via_fetch=""
+  _l2tp_active && _has su && id l2tp-fetch >/dev/null 2>&1 && _via_fetch=1
   for _u in https://api64.ipify.org https://icanhazip.com; do
-    _r=$(_to 10 curl -"$1" -fsS -A 'Mozilla/5.0' --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null | tr -d ' \r\n')
+    if [ -n "$_via_fetch" ]; then
+      _r=$(_to 10 su -s /bin/sh -c "curl -$1 -fsS -A Mozilla/5.0 --connect-timeout 5 --max-time 8 $_u" l2tp-fetch 2>/dev/null | tr -d ' \r\n')
+    else
+      _r=$(_to 10 curl -"$1" -fsS -A 'Mozilla/5.0' --connect-timeout 5 --max-time 8 "$_u" 2>/dev/null | tr -d ' \r\n')
+    fi
     if [ "$1" = 4 ] && _is_ip4 "$_r"; then printf '%s' "$_r"; return 0; fi
     if [ "$1" = 6 ] && _is_ip6 "$_r"; then printf '%s' "$_r"; return 0; fi
   done
