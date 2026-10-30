@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.6"
+WGL_VERSION="1.1.7"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1065,9 +1065,28 @@ port_fams() { # port_fams <端口>
   printf '%s' "$_r4${_r4:+${_r6:+ }}$_r6"
 }
 
+# 隧道 MTU：配置里写了就用它，没写用默认值（内核网卡 1420、无网卡 1408）；
+# 但不能超过“服务器出网网卡的 MTU − WireGuard 包头”（IPv4 落地 60、IPv6 落地 80）。
+# 很多 NAT 小鸡、云服务器网卡 MTU 不到 1500，隧道 MTU 还按 1420 设，大包就被丢：
+# 延迟测试正常，网页却打不开或特别慢。
+wg_mtu() {
+  _m="$WG_MTU"
+  if [ -z "$_m" ]; then if [ "$MODE" = kernel ]; then _m=1420; else _m=1408; fi; fi
+  _epip="$WG_EP_HOST"
+  [ "$WG_EP_KIND" = name ] && _epip=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}")
+  _dev=""
+  [ -n "$_epip" ] && _has ip && _dev=$(ip route get "$_epip" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  _nic=""
+  [ -n "$_dev" ] && [ "$_dev" != "$WGL_IFACE" ] && _nic=$(cat "/sys/class/net/$_dev/mtu" 2>/dev/null)
+  case "$_nic" in ''|*[!0-9]*) _nic=1500 ;; esac
+  case "$_epip" in *:*) _hd=80 ;; *) _hd=60 ;; esac
+  [ $((_nic - _hd)) -lt "$_m" ] && _m=$((_nic - _hd))
+  [ "$_m" -lt 1280 ] && _m=1280
+  printf '%s' "$_m"
+}
+
 write_gw_json() { # write_gw_json <输出文件>
-  _mtu="$WG_MTU"
-  if [ -z "$_mtu" ]; then if [ "$MODE" = kernel ]; then _mtu=1420; else _mtu=1408; fi; fi
+  _mtu=$(wg_mtu)
   # 无网卡模式里，sing-box 自己连落地机：域名用系统 DNS 解析，按服务器有的网络选 IPv4/IPv6
   "$JQ" -n \
     --arg mode "$MODE" --arg iface "$WGL_IFACE" --argjson mark "$WGL_MARK" \
@@ -1197,7 +1216,7 @@ kernel_up() {
   rm -f "$_sc"
   for _a in $WG_ADDR4; do ip -4 addr add "$_a" dev "$WGL_IFACE" || { ip link del dev "$WGL_IFACE"; return 1; }; done
   for _a in $WG_ADDR6; do ip -6 addr add "$_a" dev "$WGL_IFACE" 2>/dev/null; done
-  ip link set dev "$WGL_IFACE" mtu "${WG_MTU:-1420}" up || { ip link del dev "$WGL_IFACE"; return 1; }
+  ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" up || { ip link del dev "$WGL_IFACE"; return 1; }
   _rules_add
   log "内核网卡 $WGL_IFACE 已建好"
 }
@@ -1869,6 +1888,7 @@ do_status() {
     *) say "  模式：无网卡模式（sing-box 里跑 WireGuard，不需要 TUN）" ;;
   esac
   say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
+  say "  隧道 MTU：$(wg_mtu)"
   say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
   if gw_active; then say "  网关服务：运行中"; else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
   if [ "$MODE" = kernel ] && _has wg; then
