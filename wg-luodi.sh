@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.16"
+WGL_VERSION="1.1.17"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -94,6 +94,9 @@ WGL_PREF=${WGL_PREF:-5188}                        # 专用路由规则的优先�
 WGL_EPMARK=${WGL_EPMARK:-51889}                   # WireGuard 自己连落地机的包的标记（首选）
 WGL_EPPREF=${WGL_EPPREF:-5189}                    # “这种包走服务器自己的网卡”规则的优先级
 WGL_L2TP_DIR=${WGL_L2TP_DIR:-/etc/l2tp-vless}      # L2TP-VPS 装好后的目录（用来认出它，见 _ep_cands）
+WGL_TRACE_URL=${WGL_TRACE_URL:-https://1.1.1.1/cdn-cgi/trace}                     # 试路：很小的一个网页
+WGL_PROBE_URL=${WGL_PROBE_URL:-https://speed.cloudflare.com/__down?bytes=2000000}  # 试路：2MB，看大包能不能过
+WGL_SPEED_URL=${WGL_SPEED_URL:-https://speed.cloudflare.com/__down?bytes=25000000} # 测速：25MB
 WGL_WAIT=${WGL_WAIT:-25}                          # 等网关启动最多几秒
 WGL_RAW_URL=${WGL_RAW_URL:-https://raw.githubusercontent.com/imthnio/VPS-WireGuard-luodi/main/wg-luodi.sh}
 GH_MIRRORS=${GH_MIRRORS:-"https://v6.gh-proxy.org/ https://gh.llkk.cc/ https://ghproxy.net/"}
@@ -1277,14 +1280,15 @@ _ping_tun() { ping $_pf -c 3 -i 0.2 -W 1 -m "$WGL_MARK" -M "do" -s "$1" "$_pt" >
 #      2：判断不了（没有支持 -M/-m 的 ping，比如 Alpine 的 busybox；落地不回 ping）。
 # IP 包头：IPv4 + ICMP 是 28 字节，IPv6 + ICMPv6 是 48 字节，MTU = 数据大小 + 包头。
 _mtu_probe() {
-  _has ping || return 2
+  _has ping || { _tcp_probe; return $?; }
   if [ "$WG_HAS4" = 1 ]; then _pt=1.1.1.1; _pf=""; _ph=28
   elif [ "$WG_HAS6" = 1 ]; then _pt=2606:4700:4700::1111; _pf=-6; _ph=48
   else return 2; fi
-  ping -c 1 -W 1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1 || return 2
+  ping -c 1 -W 1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1 || { _tcp_probe; return $?; }
   _pm=$(_epm); _top=$(wg_mtu)
   ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
-  _ping_tun 56 || return 2
+  # 很多落地机不回 ping：这时改用真的下载来判断，免得能直连也被当成“判断不了”、被迫套在别的隧道里走（慢）
+  _ping_tun 56 || { _tcp_probe; return $?; }
   for _s in "$_top" 1400 1380 1340 1300 1280; do
     [ "$_s" -le "$_top" ] || continue
     if _ping_tun $((_s - _ph)); then
@@ -1323,7 +1327,7 @@ _ep_pick() {
     # 本脚本自己的标记：判断不了大包时照旧用（和以前一样）；借用 L2TP 的直连标记：必须确认大包能过才用。
     if [ "$_pr" = 0 ] || { [ "$_pr" = 2 ] && [ "$EPM_TRY" = "$WGL_EPMARK" ]; }; then
       [ "$EPM_TRY" = "$WGL_EPMARK" ] || _ep_rule_del
-      st_set EP_MARK "$EPM_TRY"; st_set EP_CHECK 2; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
+      st_set EP_MARK "$EPM_TRY"; st_set EP_CHECK 3; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
       EPM_TRY=""; return 0
     fi
     st_set EP_MTU ""
@@ -1338,9 +1342,31 @@ _ep_pick() {
   else
     st_set EP_MARK retry; log "落地机怎么都握不上手（可能暂时不在线），先走默认的路，巡检时再试"
   fi
-  st_set EP_CHECK 2
+  st_set EP_CHECK 3
   EPM_TRY=""
   return 0
+}
+
+# 不靠 ping 的办法：curl 绑在 wg-luodi 网卡上经隧道下载。TCP 会按网卡 MTU 把包塞满，
+# 能完整下载 2MB 就说明这么大的包过得去。先用 MTU 1280 访问一个很小的网页，确认隧道本身能上网，
+# 再从当前 MTU 往下试 1340、1280。返回值和 _mtu_probe 一样（0 找到 / 1 大包过不去 / 2 判断不了）。
+_curl_tun() { _to 25 curl -4 -fsS -o /dev/null --interface "$WGL_IFACE" --connect-timeout 8 --max-time 20 "$1" 2>/dev/null; }
+_tcp_probe() {
+  [ "$WG_HAS4" = 1 ] && _has curl || return 2
+  _pm=$(_epm); _top=$(wg_mtu)
+  ip link set dev "$WGL_IFACE" mtu 1280 2>/dev/null
+  if ! _curl_tun "$WGL_TRACE_URL"; then ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null; return 2; fi
+  for _s in "$_top" 1340 1280; do
+    [ "$_s" -le "$_top" ] || continue
+    ip link set dev "$WGL_IFACE" mtu "$_s" 2>/dev/null
+    if _curl_tun "$WGL_PROBE_URL"; then
+      st_set EP_MTU "$_pm:$_s"
+      [ "$_s" = "$_top" ] || log "这条路大包只能过 $_s（下载实测），隧道 MTU 调成 $_s"
+      return 0
+    fi
+  done
+  ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
+  return 1
 }
 
 kernel_up() {
@@ -1389,9 +1415,14 @@ kernel_ensure() {
   _live_sync
   # 用着直连标记却很久没握手（比如别的程序改了防火墙）：清掉选择，让网关重启时重新试
   _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
-  # 1.1.13 及以前选路只看握手、没试过大包：升级后重新选一次（网关重启，隧道会短暂重连一次）
-  case "$(st_get EP_MARK)" in ''|retry) ;; *)
-    if [ "$(st_get EP_CHECK)" != 2 ]; then st_set EP_MARK ""; log "按新办法（握手 + 大包都要通）重新选一次连落地机的路"; return 1; fi ;;
+  # 选路办法升级后重新选一次（网关重启，隧道会短暂重连一次）：
+  #   1.1.13 及以前只看握手、没试过大包（EP_CHECK 不是 2/3）；
+  #   1.1.16 及以前只会用 ping 试大包，落地不回 ping 时被迫套在别的隧道里走（off 且 EP_CHECK 不是 3）。
+  _ck=$(st_get EP_CHECK)
+  case "$(st_get EP_MARK)" in
+    ''|retry) ;;
+    off) if [ "$_ck" != 3 ]; then st_set EP_MARK ""; log "按新办法（ping 不通就实际下载试）重新选一次连落地机的路"; return 1; fi ;;
+    *) if [ "$_ck" != 2 ] && [ "$_ck" != 3 ]; then st_set EP_MARK ""; log "按新办法（握手 + 大包都要通）重新选一次连落地机的路"; return 1; fi ;;
   esac
   # 上次没选成（retry）也在这里重试：这时隧道本来就不通，重启网关不影响什么
   case "$(st_get EP_MARK)" in off) ;; *)
@@ -2001,6 +2032,12 @@ wg_exit_ip() {
   ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)"
 }
 server_ip() { ip_via -4 || ip_via -6; }
+# 测下载速度（Mbps）。超时（30 秒）也照样用已经下载的部分算平均速度。
+_speed() { # _speed [curl 参数…]
+  _has curl || return 1
+  _b=$(_to 40 curl -sS -o /dev/null -w '%{speed_download}' --connect-timeout 8 --max-time 30 "$@" "$WGL_SPEED_URL" 2>/dev/null)
+  awk -v b="$_b" 'BEGIN { if (b + 0 <= 0) exit 1; printf "%.1f", b * 8 / 1000000 }'
+}
 # 服务器装了 L2TP-VPS（而且没关掉）时，“平时的出口”是 L2TP 的 IP，不是服务器自己的 IP，提示一句免得看糊涂。
 _l2tp_note() {
   [ -f "$WGL_L2TP_DIR/v2-owned" ] && [ ! -f "$WGL_L2TP_DIR/disabled" ] || return 0
@@ -2060,7 +2097,7 @@ do_status() {
   esac
   say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
   say "  隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)$( [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in
-      off) echo "（直连不通，走服务器默认的路）" ;; ''|retry) if gw_picking; then echo "（正在选路）"; else echo "（还没选好，巡检时会再试）"; fi ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
+      off) if [ -n "$(_l2tp_note)" ]; then echo "（直连没通过检查：WireGuard 套在 L2TP 里面走，速度会比 L2TP 本身慢）"; else echo "（直连不通，走服务器默认的路）"; fi ;; ''|retry) if gw_picking; then echo "（正在选路）"; else echo "（还没选好，巡检时会再试）"; fi ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
   say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
   if gw_active; then say "  网关服务：运行中"
   elif gw_picking; then say "  网关服务：正在启动（正在选连落地机的路，最多一分钟左右）"
@@ -2702,6 +2739,25 @@ do_uninstall() {
   info "卸载完成。系统里装的 jq、curl、wireguard-tools 这些通用小工具没有删（别的程序可能也在用）。"
 }
 
+# 测速：同一个文件，经 WireGuard 和经服务器平时的出口各下载一次，对比速度，顺便说明 WireGuard 走的是哪条路。
+do_speed() {
+  load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
+  step "测速（各下载 25MB，最多各 30 秒）"
+  [ "$MODE" = kernel ] && say "  WireGuard 连落地机走的网卡：$(_ep_dev_show)    隧道 MTU：$(wg_mtu)"
+  gw_active || { err "网关没在运行，测不了 WireGuard 的速度（试试 wg-luodi restart）"; return 1; }
+  say "  正在经 WireGuard 下载…"
+  _w=$(_speed -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)")
+  say "  正在经服务器平时的出口下载…"
+  _d=$(_speed)
+  say "  经 WireGuard（落地机）：${_w:-测不出来} Mbps"
+  say "  服务器平时的出口：${_d:-测不出来} Mbps$(_l2tp_note)"
+  if [ "$MODE" = kernel ] && [ "$(st_get EP_MARK)" = off ] && [ -n "$(_l2tp_note)" ]; then
+    warn "WireGuard 现在套在 L2TP 里面走（每个包包两层），速度不会超过 L2TP。直连没通过检查，详情看 /etc/wg-luodi/log"
+  elif [ -n "$_w" ] && [ -n "$_d" ]; then
+    say "  WireGuard 慢很多、而它走的是服务器自己的网卡时，多半是落地机本身的带宽或线路（服务器到落地机的距离）限制。"
+  fi
+}
+
 # ---------- 24. 中文菜单 ----------
 do_menu() {
   need_root
@@ -2718,6 +2774,7 @@ do_menu() {
     say "  8) 重启网关"
     say "  9) 卸载（恢复所有节点、删除全部）"
     say "  10) 更新 wg-luodi 到最新版（配置、端口都保留）"
+    say "  11) 测速（WireGuard 和服务器平时的出口对比）"
     say "  0) 退出"
     ask "请选择" 1
     case "$ANS" in
@@ -2731,6 +2788,7 @@ do_menu() {
       8) ( do_restart ) ;;
       9) do_uninstall; return 0 ;;
       10) ( do_self_update ) && say "  请重新输入 wg-luodi 打开新版菜单。"; return 0 ;;
+      11) ( do_speed ) ;;
       0|q|Q) return 0 ;;
       *) warn "没有这个选项" ;;
     esac
@@ -2743,6 +2801,7 @@ wg-luodi $WGL_VERSION —— WireGuard 落地管理
   wg-luodi                 打开中文菜单
   wg-luodi status          查看状态和出口 IP
   wg-luodi test [端口]      逐个节点实测出口 IP
+  wg-luodi speed           测速：WireGuard 和服务器平时的出口对比
   wg-luodi add-port 端口…   添加走 WireGuard 的端口
   wg-luodi del-port 端口…   去掉走 WireGuard 的端口
   wg-luodi set-conf [文件]  更换 WireGuard 配置（不给文件就让你粘贴）
@@ -2766,6 +2825,7 @@ main() {
     down) do_down ;;
     status) need_root; do_status ;;
     test) need_root; do_test "$2" ;;
+    speed) need_root; do_speed ;;
     add-port) need_root; shift; _ports_change add "$@" ;;
     del-port|remove-port) need_root; shift; _ports_change del "$@" ;;
     set-conf|replace-conf) need_root; do_set_conf "$2" ;;

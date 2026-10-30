@@ -156,20 +156,31 @@ class EpMarkTest(unittest.TestCase):
         (self.sb.etc / "state").write_text("")
         env = {"WGL_L2TP_DIR": str(self.sb.tmp / "none")}
         env.update(extra)
-        r = self.sb.source("MODE=kernel; WG_HAS4=1; _ep_pick; st_get EP_MARK; st_get EP_MTU; st_get EP_CHECK; wg_mtu", env)
+        # 下载试路：FAKE_CURL=ok 表示经隧道能下载，FAKE_CURL_MAX=N 表示网卡 MTU 超过 N 时下不下来
+        stub = ('_curl_tun() { [ "$FAKE_CURL" = ok ] || return 1; [ -z "$FAKE_CURL_MAX" ] && return 0; '
+                '_m=$(cat "$WGL_DIR/mtu" 2>/dev/null || echo 1420); [ "$_m" -le "$FAKE_CURL_MAX" ]; }; '
+                'ip() { case "$*" in *"link set dev"*mtu*) echo "$6" > "$WGL_DIR/mtu";; esac; command ip "$@"; }; ')
+        r = self.sb.source(stub + "MODE=kernel; WG_HAS4=1; _ep_pick; st_get EP_MARK; st_get EP_MTU; st_get EP_CHECK; wg_mtu", env)
         return r.stdout.split(), r
 
     def test_pick_needs_big_packets_through_l2tp_mark(self):
         out, r = self.pick(self.l2tp())                                  # 大包能过：用 L2TP 的直连标记
-        self.assertEqual(out, ["149122", "149122:1420", "2", "1420"], r.stderr)
+        self.assertEqual(out, ["149122", "149122:1420", "3", "1420"], r.stderr)
         out, r = self.pick(dict(self.l2tp(), FAKE_PING_MAX="1300"))     # 路上 MTU 小：调小隧道 MTU 后照样用
         self.assertEqual(out[:2], ["149122", "149122:1300"], r.stderr)
         self.assertEqual(out[-1], "1300")
         out, r = self.pick(dict(self.l2tp(), FAKE_PING_MAX="100"))      # 握手能成、大包过不去：不用这条路
         self.assertEqual(out[0], "off", r.stderr)
         self.assertIn("大包过不去", (self.sb.etc / "log").read_text())
-        out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1"))         # 没法确认大包：借来的标记不用
+        out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1"))         # 不回 ping、也下载不了：借来的标记不用
         self.assertEqual(out[0], "off", r.stderr)
+
+    def test_pick_uses_a_download_when_ping_is_blocked(self):
+        # 很多落地机不回 ping：实际下载能成功就照样直连，不被迫套在 L2TP 里走
+        out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1", FAKE_CURL="ok"))
+        self.assertEqual(out[:3], ["149122", "149122:1420", "3"], r.stderr)
+        out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1", FAKE_CURL="ok", FAKE_CURL_MAX="1340"))
+        self.assertEqual(out[:2], ["149122", "149122:1340"], r.stderr)   # 大包只能过 1340：隧道 MTU 调小后照样直连
 
     def test_probe_works_for_ipv6_only_tunnels(self):
         (self.sb.etc / "state").write_text("")
@@ -184,6 +195,23 @@ class EpMarkTest(unittest.TestCase):
         self.assertEqual(out[0], "51889", r.stderr)
         out, r = self.pick({"FAKE_PING_MAX": "100"})                    # 自己的标记：大包确定过不去也换路
         self.assertEqual(out[0], "off", r.stderr)
+
+    def test_off_from_older_ping_only_check_is_rechecked(self):
+        # 1.1.16 及以前：落地不回 ping 时被迫套在 L2TP 里走（off、EP_CHECK=2），升级后用下载再试一次
+        (self.sb.etc / "state").write_text("EP_MARK=off\nEP_CHECK=2\n")
+        r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
+                           '_live_sync() { :; }; kernel_ensure; echo "rc=$?"')
+        self.assertEqual(r.stdout.split(), ["rc=1"], r.stderr)
+        (self.sb.etc / "state").write_text("EP_MARK=149122\nEP_CHECK=2\n")   # 已经直连的不动
+        r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
+                           '_live_sync() { :; }; WG_EP_KIND=ip; kernel_ensure; echo "rc=$?"')
+        self.assertEqual(r.stdout.split(), ["rc=0"], r.stderr)
+
+    def test_speed_is_reported_in_mbps(self):
+        r = self.sb.source('curl() { printf 1250000; }; _speed')
+        self.assertEqual(r.stdout, "10.0", r.stderr)                     # 1250000 字节/秒 = 10 Mbps
+        r = self.sb.source('curl() { printf 0; }; _speed || echo NONE')
+        self.assertEqual(r.stdout.strip(), "NONE", r.stderr)
 
     def test_l2tp_note(self):
         r = self.sb.source('_l2tp_note', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
@@ -207,7 +235,7 @@ class EpMarkTest(unittest.TestCase):
         r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
                            '_live_sync() { :; }; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
         self.assertEqual(r.stdout.split(), ["rc=1"], r.stderr)          # 让网关重启、重新选路
-        (self.sb.etc / "state").write_text("EP_MARK=off\nEP_CHECK=2\n")
+        (self.sb.etc / "state").write_text("EP_MARK=off\nEP_CHECK=3\n")
         r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
                            '_live_sync() { :; }; WG_EP_KIND=ip; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
         self.assertEqual(r.stdout.split(), ["rc=0", "off"], r.stderr)
