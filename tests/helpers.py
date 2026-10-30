@@ -81,6 +81,7 @@ case "$*" in
   *"route show default"*) echo "default via 10.9.9.1 dev eth0"; exit 0 ;;
   *"route get"*) echo "1.1.1.1 via 10.9.9.1 dev eth0 src 10.9.9.2"; exit 0 ;;
   *"rule del"*) exit 1 ;;
+  *"rule show"*) [ -n "$FAKE_IP_RULES" ] && printf '%b' "$FAKE_IP_RULES"; exit 0 ;;
   "link add dev wgl-probe0 type wireguard") [ "$FAKE_NO_KMOD" = 1 ] && exit 1; exit 0 ;;
   "link show dev wg-luodi") [ -f "$FAKE_LOG.link" ] && exit 0 || exit 1 ;;
   "link add dev wg-luodi type wireguard") touch "$FAKE_LOG.link"; exit 0 ;;
@@ -91,6 +92,15 @@ exit 0
 
 FAKE_LOGONLY = r'''#!/bin/sh
 echo "$(basename "$0") $*" >> "$FAKE_LOG"
+exit 0
+'''
+
+# 假 wg：只记日志；问“最近握手”时说刚握过（FAKE_NO_HS=1 时说从没握过）
+FAKE_WG = r'''#!/bin/sh
+echo "wg $*" >> "$FAKE_LOG"
+case "$*" in
+  *latest-handshakes*) if [ "$FAKE_NO_HS" = 1 ]; then printf 'k\t0\n'; else printf 'k\t%s\n' "$(date +%s)"; fi ;;
+esac
 exit 0
 '''
 
@@ -197,7 +207,7 @@ class Sandbox:
         self.tmp = Path(tempfile.mkdtemp(prefix="wgl-test-", dir=os.environ.get("WGL_TEST_TMP")))
         self.stubs = self.tmp / "stubs"
         self.stubs.mkdir()
-        for name, body in (("ip", FAKE_IP), ("wg", FAKE_LOGONLY), ("modprobe", FAKE_LOGONLY),
+        for name, body in (("ip", FAKE_IP), ("wg", FAKE_WG), ("modprobe", FAKE_LOGONLY),
                            ("sysctl", FAKE_LOGONLY), ("rc-update", FAKE_LOGONLY), ("openrc-run", FAKE_LOGONLY),
                            ("apt-get", FAKE_FAIL), ("apk", FAKE_FAIL), ("dnf", FAKE_FAIL), ("yum", FAKE_FAIL),
                            ("systemctl", FAKE_FAIL), ("rc-service", FAKE_RC_SERVICE),

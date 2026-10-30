@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.10"
+WGL_VERSION="1.1.11"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1087,8 +1087,6 @@ wg_mtu() {
   printf '%s' "$_m"
 }
 
-# 内核网卡模式：不重建网卡，原地补齐“连落地机走服务器自己网卡”的规则，MTU 不对就改（不断流）。
-# 网关配置里不含这些，更新时网关不重启，只靠这里跟上；巡检也会调用（出网网卡 MTU 变了能自动跟上）。
 _ep_dev_show() { # 状态页用：WireGuard 连落地机实际走哪张网卡
   _epip="$WG_EP_HOST"
   [ "$WG_EP_KIND" = name ] && _epip=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}")
@@ -1096,6 +1094,8 @@ _ep_dev_show() { # 状态页用：WireGuard 连落地机实际走哪张网卡
   [ -n "$_epip" ] && _has ip && _d=$(ip route get "$_epip" $(_epm_arg) 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
   printf '%s' "${_d:-没查到}"
 }
+# 内核网卡模式：不重建网卡，原地补齐“连落地机走服务器自己网卡”的规则，MTU 不对就改（不断流）。
+# 网关配置里不含这些，更新时网关不重启，只靠这里跟上；巡检也会调用（出网网卡 MTU 变了能自动跟上）。
 _live_sync() {
   [ "$MODE" = kernel ] || return 0
   [ "$(_epm)" = "$WGL_EPMARK" ] && _ep_rule_sync
@@ -1228,10 +1228,13 @@ _rules_sync() {
 #   ② 服务器上已有的“带某标记就查主路由表”的标记（这类全局出口工具留给直连流量的通道，防火墙会放行）；
 #   ③ 都握不上手：不打标记，走服务器默认的路（和以前一样），MTU 按那条路自动调小。
 # 哪个能和落地机握手就用哪个，记在状态里（EP_MARK），以后直接用；别的程序的规则和防火墙一条都不动。
+# EP_MARK：空 = 还没选；数字 = 用这个标记；off = 直连都不通，走默认的路；
+#          retry = 试的时候落地机怎么都握不上手（多半是落地机暂时不在线），先走默认的路，巡检时再试。
 _epm() { # 现在用的标记：数字或 off（试的时候用 EPM_TRY）
   _x=${EPM_TRY:-$(st_get EP_MARK)}
   [ "$MODE" = kernel ] || _x=off
-  printf '%s' "${_x:-$WGL_EPMARK}"
+  case "$_x" in '') _x=$WGL_EPMARK ;; *[!0-9]*) _x=off ;; esac
+  printf '%s' "$_x"
 }
 _epm_arg() { _x=$(_epm); [ "$_x" != off ] && printf 'mark %s' "$_x"; }
 _ep_rule_sync() {
@@ -1248,14 +1251,15 @@ _ep_rule_del() {
   done
   return 0
 }
-# 要试的标记：先是本脚本的，再是服务器上已有的“fwmark X lookup main”规则里的 X（十进制、去重）
+# 要试的标记：先是本脚本的，再是服务器上已有的“fwmark X lookup main”规则里的 X（十进制、去重）。
+# 落地机是 IPv6 就看 IPv6 的规则。最多试 4 个（每个最多等 8 秒，别让开机服务等超时）。
 _ep_cands() {
   { echo "$WGL_EPMARK"
-    ip -4 rule show 2>/dev/null | awk '/lookup main/ { for (i = 1; i < NF; i++) if ($i == "fwmark") { split($(i + 1), a, "/"); print a[1] } }'
+    ip -"${EP_FAM:-4}" rule show 2>/dev/null | awk '/lookup main/ { for (i = 1; i < NF; i++) if ($i == "fwmark") { split($(i + 1), a, "/"); print a[1] } }'
   } | while read -r _x; do
     case "$_x" in 0x*|0X*) _x=$((_x)) ;; ''|*[!0-9]*) continue ;; esac
     [ "$_x" = 0 ] || [ "$_x" = "$WGL_MARK" ] || echo "$_x"
-  done | awk '!seen[$0]++'
+  done | awk '!seen[$0]++' | head -n 4
 }
 # 把 WireGuard 配置（带标记）装进网卡。setconf 会把对端重建一遍，马上重新握手，正好用来试一条路。
 _wg_load() { # _wg_load <标记|off>
@@ -1287,7 +1291,11 @@ _ep_pick() {
   done
   _ep_rule_del
   EPM_TRY=off; _wg_load off
-  st_set EP_MARK off; log "直连握不上手，连落地机走服务器默认的路（$(_ep_dev_show)）"
+  if _hs_wait 8; then
+    st_set EP_MARK off; log "直连握不上手，连落地机走服务器默认的路（$(_ep_dev_show)）"
+  else
+    st_set EP_MARK retry; log "落地机怎么都握不上手（可能暂时不在线），先走默认的路，巡检时再试"
+  fi
   EPM_TRY=""
   return 0
 }
@@ -1309,7 +1317,7 @@ kernel_up() {
   ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" up || { ip link del dev "$WGL_IFACE"; return 1; }
   _rules_add
   # 还没选过连落地机的路：现在试（第一次装、更新、换配置、换模式后）
-  if [ -z "$(st_get EP_MARK)" ]; then _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null; fi
+  case "$(st_get EP_MARK)" in ''|retry) _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null ;; esac
   log "内核网卡 $WGL_IFACE 已建好"
 }
 
@@ -1333,9 +1341,10 @@ kernel_ensure() {
   _live_sync
   # 用着直连标记却很久没握手（比如别的程序改了防火墙）：清掉选择，让网关重启时重新试
   _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
-  case "$(st_get EP_MARK)" in ''|off) ;; *)
+  # 上次没选成（retry）也在这里重试：这时隧道本来就不通，重启网关不影响什么
+  case "$(st_get EP_MARK)" in off) ;; *)
     if [ -n "$_hs" ] && { [ "$_hs" = 0 ] || [ $(($(date +%s) - _hs)) -gt 300 ]; }; then
-      st_set EP_MARK ""; log "直连很久没握手，重新选连落地机的路"; return 1
+      st_set EP_MARK ""; log "连落地机很久没握手，重新选路"; return 1
     fi ;;
   esac
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
@@ -1989,7 +1998,8 @@ do_status() {
     *) say "  模式：无网卡模式（sing-box 里跑 WireGuard，不需要 TUN）" ;;
   esac
   say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
-  say "  隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)"
+  say "  隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)$( [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in
+      off) echo "（直连不通，走服务器默认的路）" ;; ''|retry) echo "（还没选好，巡检时会再试）" ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
   say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
   if gw_active; then say "  网关服务：运行中"; else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
   if [ "$MODE" = kernel ] && _has wg; then
@@ -2320,7 +2330,7 @@ do_update() {
   install_services
   [ "$(_svc_sum)" = "$_svc_before" ] || _gw_changed=1
   # 内核网卡模式还没选过连落地机的路：要重建网卡才能试，这次重启网关
-  [ "$MODE" = kernel ] && [ -z "$(st_get EP_MARK)" ] && _gw_changed=1
+  [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in ''|retry) true ;; *) false ;; esac && _gw_changed=1
   # 3. 网关程序、网关配置、开机服务都没变，而且网关现在是通的：不重启网关，走 WireGuard 的节点一秒都不断。
   #    内核网卡模式只把专用路由规则补齐（缺了才加，不删不重建）。
   #    有变化才重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版。

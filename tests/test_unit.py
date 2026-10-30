@@ -109,6 +109,39 @@ class ConfTest(unittest.TestCase):
             self.assertIn("BAD", r.stdout, bad)
 
 
+class EpMarkTest(unittest.TestCase):
+    """WireGuard 连落地机走哪条路：候选标记、状态解读、握手选择。"""
+    RULES = ("0:\\tfrom all lookup local\\n5188:\\tfrom all fwmark 0xcab0 lookup 51888\\n"
+             "8904:\\tfrom all fwmark 0x24681 lookup 24680\\n8905:\\tfrom all fwmark 0x24680 lookup main\\n"
+             "8906:\\tfrom all fwmark 0x24682/0xffff lookup main\\n8920:\\tfrom all lookup 24680\\n")
+
+    def setUp(self):
+        self.sb = Sandbox()
+        self.sb.etc.mkdir()
+
+    def tearDown(self):
+        self.sb.cleanup()
+
+    def test_candidates(self):
+        r = self.sb.source("_ep_cands", {"FAKE_IP_RULES": self.RULES})
+        self.assertEqual(r.stdout.split(), ["51889", "149120", "149122"], r.stderr)
+
+    def test_epm_states(self):
+        for st, mode, want in (("", "kernel", "51889"), ("149122", "kernel", "149122"), ("off", "kernel", "off"),
+                               ("retry", "kernel", "off"), ("149122", "userspace", "off")):
+            (self.sb.etc / "state").write_text("EP_MARK=%s\n" % st)
+            r = self.sb.source("MODE=%s; _epm" % mode)
+            self.assertEqual(r.stdout, want, (st, mode))
+
+    def test_pick(self):
+        (self.sb.etc / "state").write_text("")
+        r = self.sb.source("MODE=kernel; _ep_pick; st_get EP_MARK", {"FAKE_IP_RULES": self.RULES})
+        self.assertEqual(r.stdout.strip(), "51889", r.stderr)      # 第一个候选就握上手
+        r = self.sb.source("MODE=kernel; _hs_wait() { return 1; }; _ep_pick; st_get EP_MARK", {"FAKE_NO_HS": "1"})
+        self.assertEqual(r.stdout.strip(), "retry", r.stderr)      # 怎么都握不上：之后再试
+        self.assertFalse(list((self.sb.etc / "wireguard").glob("*")))   # 临时钥匙文件不留
+
+
 @unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")
 class GatewayAndPatchTest(unittest.TestCase):
     def setUp(self):
