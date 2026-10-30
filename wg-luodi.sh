@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.4"
+WGL_VERSION="1.1.5"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -84,6 +84,7 @@ WGL_LIB=${WGL_LIB:-/usr/local/lib/wg-luodi}       # sing-box 网关程序、jq
 WGL_CMD=${WGL_CMD:-/usr/local/bin/wg-luodi}       # 管理命令
 WGL_SD=${WGL_SD:-/etc/systemd/system}             # systemd 服务文件
 WGL_INITD=${WGL_INITD:-/etc/init.d}               # OpenRC 服务脚本
+WGL_WGDIR=${WGL_WGDIR:-/etc/wireguard}            # wg setconf 的临时配置放这里（Ubuntu 的 AppArmor 只许 wg 读这个目录）
 XN_NODES=${XN_NODES:-/etc/xray-node/nodes}        # VPS-dajianjiedian 的节点目录
 XN_BIN_DIR=${XN_BIN_DIR:-/usr/local/bin}          # VPS-dajianjiedian 装 xray / sing-box / hysteria 的位置
 WGL_IFACE=${WGL_IFACE:-wg-luodi}                  # 内核网卡模式的网卡名
@@ -1183,7 +1184,10 @@ kernel_up() {
   ip link add dev "$WGL_IFACE" type wireguard || { err "建不了 WireGuard 网卡"; return 1; }
   # 回来的包从 wg-luodi 进来，严格的“反向路径检查”会把它当成假包丢掉，这张网卡单独改成宽松模式
   echo 2 > "/proc/sys/net/ipv4/conf/$WGL_IFACE/rp_filter" 2>/dev/null
-  _sc="$WGL_DIR/wg-setconf.conf"
+  # Ubuntu 新版自带 wg 的 AppArmor 规则：wg 只能读 /etc/wireguard/ 里的文件，
+  # 放别处会报 “fopen: Permission denied”，所以临时配置写到这个目录里
+  mkdir -p "$WGL_WGDIR" && chmod 700 "$WGL_WGDIR"
+  _sc="$WGL_WGDIR/$WGL_IFACE-setconf.conf"
   _wg_setconf_file > "$_sc"; chmod 600 "$_sc"
   if ! wg setconf "$WGL_IFACE" "$_sc"; then
     ip link del dev "$WGL_IFACE" >/dev/null 2>&1; rm -f "$_sc"; err "WireGuard 配置装不进网卡"; return 1

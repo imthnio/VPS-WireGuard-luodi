@@ -229,7 +229,7 @@ class Sandbox:
             path = "%s:%s:/usr/bin:/bin" % (self.stubs, self.tools)
         self.env = {
             "PATH": path, "HOME": str(self.tmp), "TMPDIR": str(self.tmp),
-            "WGL_ALLOW_NONROOT": "1", "WGL_DIR": str(self.etc), "WGL_LIB": str(self.lib),
+            "WGL_ALLOW_NONROOT": "1", "WGL_DIR": str(self.etc), "WGL_WGDIR": str(self.etc / "wireguard"), "WGL_LIB": str(self.lib),
             "WGL_CMD": str(self.cmd), "WGL_SD": str(self.tmp / "systemd"), "WGL_INITD": str(self.initd),
             "XN_NODES": str(self.nodes), "XN_BIN_DIR": str(self.bindir), "WGL_INIT": "openrc",
             "WGL_NO_PROC_SCAN": "1", "WGL_KNOWN_PATHS": "", "WGL_NO_PKG": "1", "WGL_WAIT": "15",
