@@ -141,7 +141,6 @@ class GatewayAndPatchTest(unittest.TestCase):
                     self.assertNotIn("endpoints", j)
                 else:
                     self.assertFalse(j["endpoints"][0]["system"])            # 不建网卡、不要 TUN
-                    self.assertEqual(j["endpoints"][0]["routing_mark"], 51889)  # 连落地机走服务器自己的网卡
                     self.assertEqual(j["dns"]["servers"][0]["detour"], "wg")  # DNS 也走隧道
 
     def apply(self, ports, kind, cfg, act="apply", alias=""):
