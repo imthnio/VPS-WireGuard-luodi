@@ -124,7 +124,7 @@ class EpMarkTest(unittest.TestCase):
 
     def test_candidates(self):
         r = self.sb.source("_ep_cands", {"FAKE_IP_RULES": self.RULES})
-        self.assertEqual(r.stdout.split(), ["51889", "149120", "149122"], r.stderr)
+        self.assertEqual(r.stdout.split(), ["51889"], r.stderr)   # 不借用别的程序的直连标记
 
     def test_epm_states(self):
         for st, mode, want in (("", "kernel", "51889"), ("149122", "kernel", "149122"), ("off", "kernel", "off"),
