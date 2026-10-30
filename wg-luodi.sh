@@ -1270,13 +1270,13 @@ _ep_cands() {
   fi
 }
 # 经隧道 ping 1.1.1.1（带专用标记，走 wg-luodi 网卡；-M do 禁止分片），包大小 = $1 字节的数据。
-_ping_tun() { ping -c 3 -i 0.2 -W 1 -m "$WGL_MARK" -M do -s "$1" 1.1.1.1 >/dev/null 2>&1; }
+_ping_tun() { ping -c 3 -i 0.2 -W 1 -m "$WGL_MARK" -M "do" -s "$1" 1.1.1.1 >/dev/null 2>&1; }
 # 这条路大包能不能过。从按网卡算出的 MTU 往下试，找出真能过的最大 MTU，记在 EP_MTU（“标记:MTU”）。
 # 返回 0：找到了；1：小包能过、大包都过不去（这条路传不了网页）；
 #      2：判断不了（没有支持 -M/-m 的 ping，比如 Alpine 的 busybox；落地不回 ping；隧道没有 IPv4）。
 _mtu_probe() {
   [ "$WG_HAS4" = 1 ] && _has ping || return 2
-  ping -c 1 -W 1 -M do -s 16 127.0.0.1 >/dev/null 2>&1 || return 2
+  ping -c 1 -W 1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1 || return 2
   _pm=$(_epm); _top=$(wg_mtu)
   ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
   _ping_tun 56 || return 2
