@@ -208,9 +208,9 @@ class EpMarkTest(unittest.TestCase):
         self.assertEqual(r.stdout.split(), ["rc=0"], r.stderr)
 
     def test_speed_is_reported_in_mbps(self):
-        r = self.sb.source('curl() { printf 1250000; }; _speed')
+        r = self.sb.source('_to() { shift; "$@"; }; curl() { printf 1250000; }; _speed')
         self.assertEqual(r.stdout, "10.0", r.stderr)                     # 1250000 字节/秒 = 10 Mbps
-        r = self.sb.source('curl() { printf 0; }; _speed || echo NONE')
+        r = self.sb.source('_to() { shift; "$@"; }; curl() { printf 0; }; _speed || echo NONE')
         self.assertEqual(r.stdout.strip(), "NONE", r.stderr)
 
     def test_l2tp_note(self):
