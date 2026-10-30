@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.7"
+WGL_VERSION="1.1.8"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1085,6 +1085,16 @@ wg_mtu() {
   printf '%s' "$_m"
 }
 
+# 内核网卡模式：网卡 MTU 和应有的不一样就原地改（不断流）。
+# 网关配置里不写网卡 MTU，更新时网关不重启，只靠这里跟上；巡检也会调用（出网网卡 MTU 变了能自动跟上）。
+_mtu_sync() {
+  [ "$MODE" = kernel ] || return 0
+  _cur=$(cat "/sys/class/net/$WGL_IFACE/mtu" 2>/dev/null); _want=$(wg_mtu)
+  [ -n "$_cur" ] && [ "$_cur" != "$_want" ] || return 0
+  ip link set dev "$WGL_IFACE" mtu "$_want" 2>/dev/null && log "网卡 MTU $_cur → $_want"
+  return 0
+}
+
 write_gw_json() { # write_gw_json <输出文件>
   _mtu=$(wg_mtu)
   # 无网卡模式里，sing-box 自己连落地机：域名用系统 DNS 解析，按服务器有的网络选 IPv4/IPv6
@@ -1237,6 +1247,7 @@ kernel_ensure() {
   if ! ip -4 route show table "$WGL_TABLE" 2>/dev/null | grep -q default; then _rules_add; log "专用路由表丢了，已补回"; fi
   # IPv6 那一份（机器有 IPv6 才查；没有 IPv6 的内核会直接报错，不用管）
   if [ -e /proc/net/if_inet6 ] && ! ip -6 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "IPv6 专用路由规则丢了，已补回"; fi
+  _mtu_sync
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
   if [ "$WG_EP_KIND" = name ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
@@ -2223,7 +2234,7 @@ do_update() {
   #    有变化才重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版。
   WIP=""
   if [ "$_gw_changed" = 0 ] && [ -n "$_old_ok" ]; then
-    [ "$MODE" = kernel ] && _rules_sync
+    [ "$MODE" = kernel ] && { _rules_sync; _mtu_sync; }
     WIP="$_old_ok"
     info "网关没有变化，不用重启（WireGuard 出口 IP：$WIP）"
   elif ! start_and_check_gateway || { [ -z "$WIP" ] && [ -n "$_old_ok" ]; }; then
