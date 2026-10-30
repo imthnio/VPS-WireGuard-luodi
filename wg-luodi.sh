@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.9"
+WGL_VERSION="1.1.10"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -91,7 +91,7 @@ WGL_IFACE=${WGL_IFACE:-wg-luodi}                  # 内核网卡模式的网卡�
 WGL_MARK=${WGL_MARK:-51888}                       # 内核网卡模式的包标记
 WGL_TABLE=${WGL_TABLE:-51888}                     # 内核网卡模式的专用路由表
 WGL_PREF=${WGL_PREF:-5188}                        # 专用路由规则的优先级
-WGL_EPMARK=${WGL_EPMARK:-51889}                   # WireGuard 自己连落地机的包的标记
+WGL_EPMARK=${WGL_EPMARK:-51889}                   # WireGuard 自己连落地机的包的标记（首选）
 WGL_EPPREF=${WGL_EPPREF:-5189}                    # “这种包走服务器自己的网卡”规则的优先级
 WGL_WAIT=${WGL_WAIT:-25}                          # 等网关启动最多几秒
 WGL_RAW_URL=${WGL_RAW_URL:-https://raw.githubusercontent.com/imthnio/VPS-WireGuard-luodi/main/wg-luodi.sh}
@@ -1077,7 +1077,7 @@ wg_mtu() {
   _epip="$WG_EP_HOST"
   [ "$WG_EP_KIND" = name ] && _epip=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}")
   _dev=""
-  [ -n "$_epip" ] && _has ip && _dev=$(ip route get "$_epip" mark "$WGL_EPMARK" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  [ -n "$_epip" ] && _has ip && _dev=$(ip route get "$_epip" $(_epm_arg) 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
   _nic=""
   [ -n "$_dev" ] && [ "$_dev" != "$WGL_IFACE" ] && _nic=$(cat "/sys/class/net/$_dev/mtu" 2>/dev/null)
   case "$_nic" in ''|*[!0-9]*) _nic=1500 ;; esac
@@ -1087,22 +1087,18 @@ wg_mtu() {
   printf '%s' "$_m"
 }
 
-# 内核网卡模式：不重建网卡，原地补齐“连落地机走服务器自己网卡”的规则和标记，MTU 不对就改（不断流）。
+# 内核网卡模式：不重建网卡，原地补齐“连落地机走服务器自己网卡”的规则，MTU 不对就改（不断流）。
 # 网关配置里不含这些，更新时网关不重启，只靠这里跟上；巡检也会调用（出网网卡 MTU 变了能自动跟上）。
 _ep_dev_show() { # 状态页用：WireGuard 连落地机实际走哪张网卡
   _epip="$WG_EP_HOST"
   [ "$WG_EP_KIND" = name ] && _epip=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}")
   _d=""
-  [ -n "$_epip" ] && _has ip && _d=$(ip route get "$_epip" mark "$WGL_EPMARK" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+  [ -n "$_epip" ] && _has ip && _d=$(ip route get "$_epip" $(_epm_arg) 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
   printf '%s' "${_d:-没查到}"
 }
 _live_sync() {
   [ "$MODE" = kernel ] || return 0
-  _ep_rule_sync
-  _fm=$(wg show "$WGL_IFACE" fwmark 2>/dev/null)
-  if [ -n "$_fm" ] && { [ "$_fm" = off ] || [ "$((_fm))" != "$WGL_EPMARK" ]; }; then
-    wg set "$WGL_IFACE" fwmark "$WGL_EPMARK" 2>/dev/null && log "WireGuard 连落地机改走服务器自己的网卡"
-  fi
+  [ "$(_epm)" = "$WGL_EPMARK" ] && _ep_rule_sync
   _cur=$(cat "/sys/class/net/$WGL_IFACE/mtu" 2>/dev/null); _want=$(wg_mtu)
   [ -n "$_cur" ] && [ "$_cur" != "$_want" ] || return 0
   ip link set dev "$WGL_IFACE" mtu "$_want" 2>/dev/null && log "网卡 MTU $_cur → $_want"
@@ -1117,7 +1113,7 @@ write_gw_json() { # write_gw_json <输出文件>
     --arg priv "$WG_PRIV" --arg pub "$WG_PUB" --arg psk "$WG_PSK" \
     --arg host "$WG_EP_HOST" --argjson port "$WG_EP_PORT" \
     --arg addrs "$(_cidr_list "$WG_ADDR")" --arg allowed "$(_cidr_list "$WG_ALLOWED")" \
-    --argjson mtu "$_mtu" --argjson ka "$WG_KA" --argjson epmark "$WGL_EPMARK" \
+    --argjson mtu "$_mtu" --argjson ka "$WG_KA" \
     --arg dns "$WG_DNS1" --arg strat "$WG_STRAT" --arg epstrat "$EP_STRAT" \
     --argjson sp "$(st_get SOCKS_PORT)" --argjson dp "$(st_get DNS_PORT)" \
     --arg su "$(st_get SOCKS_USER)" --arg spw "$(st_get SOCKS_PASS)" '
@@ -1156,7 +1152,7 @@ write_gw_json() { # write_gw_json <输出文件>
         { outbounds: [ { type: "direct", tag: "wg-out", bind_interface: $iface, routing_mark: $mark } ] }
       else
         { endpoints: [ {
-            type: "wireguard", tag: "wg", system: false, mtu: $mtu, routing_mark: $epmark,
+            type: "wireguard", tag: "wg", system: false, mtu: $mtu,
             address: ($addrs | words), private_key: $priv,
             peers: [ ({ address: $host, port: $port, public_key: $pub,
                         allowed_ips: ($allowed | words), persistent_keepalive_interval: $ka }
@@ -1179,13 +1175,15 @@ load_all() {
 # 关键点：Table = off 的效果——不往主路由表加任何东西，服务器默认路由和 SSH 完全不动。
 # 只加一条规则：“带标记 51888 的包查 51888 号路由表”，那张表里只有一条“全部走 wg-luodi 网卡”。
 # 只有网关程序发出的包带这个标记。
-_wg_setconf_file() { # 生成 wg 命令认识的精简配置（去掉 Address、DNS 等 wg-quick 才认识的项）
+_wg_setconf_file() { # _wg_setconf_file <标记|off>：生成 wg 命令认识的精简配置（去掉 Address、DNS 等 wg-quick 才认识的项）
   _epip="$WG_EP_HOST"
   if [ "$WG_EP_KIND" = name ]; then
     _r=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}"); [ -n "$_r" ] && _epip="$_r"
   fi
   case "$_epip" in *:*) _epfmt="[$_epip]:$WG_EP_PORT" ;; *) _epfmt="$_epip:$WG_EP_PORT" ;; esac
-  printf '[Interface]\nPrivateKey = %s\nFwMark = %s\n\n[Peer]\nPublicKey = %s\n' "$WG_PRIV" "$WGL_EPMARK" "$WG_PUB"
+  printf '[Interface]\nPrivateKey = %s\n' "$WG_PRIV"
+  [ "${1:-off}" != off ] && printf 'FwMark = %s\n' "$1"
+  printf '\n[Peer]\nPublicKey = %s\n' "$WG_PUB"
   [ -n "$WG_PSK" ] && printf 'PresharedKey = %s\n' "$WG_PSK"
   printf 'AllowedIPs = %s\nEndpoint = %s\nPersistentKeepalive = %s\n' "$WG_ALLOWED" "$_epfmt" "$WG_KA"
 }
@@ -1223,10 +1221,19 @@ _rules_sync() {
   return 0
 }
 
-# WireGuard 自己连落地机的包（加密后的 UDP）带标记 51889，查主路由表，从服务器自己的网卡出去。
-# 服务器上要是装了 L2TP / WARP 之类“全局出口”（用策略路由把所有流量都拉走），
-# 这条规则排在它们前面，让 WireGuard 不经过它们，两边互不影响；它们的规则一条都不动。
-# 主路由表里没有默认路由时，这条规则查不到路，会自动落到后面的规则，和没加一样。
+# WireGuard 自己连落地机的包（加密后的 UDP）打一个标记，让它从服务器自己的网卡直接出去。
+# 服务器上要是装了 L2TP / WARP 之类“全局出口”（策略路由把所有流量拉走，有的还用防火墙封住直连），
+# WireGuard 的包会被拉进它们，MTU 变小、多绕一层。所以建网卡时按顺序试：
+#   ① 本脚本的标记 51889 + 一条“带它的查主路由表”的规则（优先级 5189，排在它们前面）；
+#   ② 服务器上已有的“带某标记就查主路由表”的标记（这类全局出口工具留给直连流量的通道，防火墙会放行）；
+#   ③ 都握不上手：不打标记，走服务器默认的路（和以前一样），MTU 按那条路自动调小。
+# 哪个能和落地机握手就用哪个，记在状态里（EP_MARK），以后直接用；别的程序的规则和防火墙一条都不动。
+_epm() { # 现在用的标记：数字或 off（试的时候用 EPM_TRY）
+  _x=${EPM_TRY:-$(st_get EP_MARK)}
+  [ "$MODE" = kernel ] || _x=off
+  printf '%s' "${_x:-$WGL_EPMARK}"
+}
+_epm_arg() { _x=$(_epm); [ "$_x" != off ] && printf 'mark %s' "$_x"; }
 _ep_rule_sync() {
   _has ip || return 0
   for _f in 4 6; do
@@ -1241,27 +1248,68 @@ _ep_rule_del() {
   done
   return 0
 }
+# 要试的标记：先是本脚本的，再是服务器上已有的“fwmark X lookup main”规则里的 X（十进制、去重）
+_ep_cands() {
+  { echo "$WGL_EPMARK"
+    ip -4 rule show 2>/dev/null | awk '/lookup main/ { for (i = 1; i < NF; i++) if ($i == "fwmark") { split($(i + 1), a, "/"); print a[1] } }'
+  } | while read -r _x; do
+    case "$_x" in 0x*|0X*) _x=$((_x)) ;; ''|*[!0-9]*) continue ;; esac
+    [ "$_x" = 0 ] || [ "$_x" = "$WGL_MARK" ] || echo "$_x"
+  done | awk '!seen[$0]++'
+}
+# 把 WireGuard 配置（带标记）装进网卡。setconf 会把对端重建一遍，马上重新握手，正好用来试一条路。
+_wg_load() { # _wg_load <标记|off>
+  mkdir -p "$WGL_WGDIR" && chmod 700 "$WGL_WGDIR"
+  _sc="$WGL_WGDIR/$WGL_IFACE-setconf.conf"
+  _wg_setconf_file "$1" > "$_sc"; chmod 600 "$_sc"
+  wg setconf "$WGL_IFACE" "$_sc"; _rc=$?
+  rm -f "$_sc"
+  return $_rc
+}
+_hs_wait() { # _hs_wait <秒>：这么多秒内和落地机握上手返回 0
+  _i=0
+  while [ "$_i" -lt "$1" ]; do
+    _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    [ -n "$_hs" ] && [ "$_hs" != 0 ] && return 0
+    _i=$((_i + 1)); sleep 1
+  done
+  return 1
+}
+_ep_pick() {
+  for EPM_TRY in $(_ep_cands); do
+    [ "$EPM_TRY" = "$WGL_EPMARK" ] && _ep_rule_sync
+    _wg_load "$EPM_TRY" >/dev/null 2>&1 || continue
+    if _hs_wait 8; then
+      [ "$EPM_TRY" = "$WGL_EPMARK" ] || _ep_rule_del
+      st_set EP_MARK "$EPM_TRY"; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
+      EPM_TRY=""; return 0
+    fi
+  done
+  _ep_rule_del
+  EPM_TRY=off; _wg_load off
+  st_set EP_MARK off; log "直连握不上手，连落地机走服务器默认的路（$(_ep_dev_show)）"
+  EPM_TRY=""
+  return 0
+}
 
 kernel_up() {
-  _ep_rule_sync
   _has modprobe && modprobe wireguard >/dev/null 2>&1
   ip link del dev "$WGL_IFACE" >/dev/null 2>&1
   ip link add dev "$WGL_IFACE" type wireguard || { err "建不了 WireGuard 网卡"; return 1; }
   # 回来的包从 wg-luodi 进来，严格的“反向路径检查”会把它当成假包丢掉，这张网卡单独改成宽松模式
   echo 2 > "/proc/sys/net/ipv4/conf/$WGL_IFACE/rp_filter" 2>/dev/null
   # Ubuntu 新版自带 wg 的 AppArmor 规则：wg 只能读 /etc/wireguard/ 里的文件，
-  # 放别处会报 “fopen: Permission denied”，所以临时配置写到这个目录里
-  mkdir -p "$WGL_WGDIR" && chmod 700 "$WGL_WGDIR"
-  _sc="$WGL_WGDIR/$WGL_IFACE-setconf.conf"
-  _wg_setconf_file > "$_sc"; chmod 600 "$_sc"
-  if ! wg setconf "$WGL_IFACE" "$_sc"; then
-    ip link del dev "$WGL_IFACE" >/dev/null 2>&1; rm -f "$_sc"; err "WireGuard 配置装不进网卡"; return 1
+  # 放别处会报 “fopen: Permission denied”，所以临时配置写到这个目录里（_wg_load 里）
+  if [ "$(_epm)" = "$WGL_EPMARK" ]; then _ep_rule_sync; else _ep_rule_del; fi
+  if ! _wg_load "$(_epm)"; then
+    ip link del dev "$WGL_IFACE" >/dev/null 2>&1; err "WireGuard 配置装不进网卡"; return 1
   fi
-  rm -f "$_sc"
   for _a in $WG_ADDR4; do ip -4 addr add "$_a" dev "$WGL_IFACE" || { ip link del dev "$WGL_IFACE"; return 1; }; done
   for _a in $WG_ADDR6; do ip -6 addr add "$_a" dev "$WGL_IFACE" 2>/dev/null; done
   ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" up || { ip link del dev "$WGL_IFACE"; return 1; }
   _rules_add
+  # 还没选过连落地机的路：现在试（第一次装、更新、换配置、换模式后）
+  if [ -z "$(st_get EP_MARK)" ]; then _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null; fi
   log "内核网卡 $WGL_IFACE 已建好"
 }
 
@@ -1283,6 +1331,13 @@ kernel_ensure() {
   # IPv6 那一份（机器有 IPv6 才查；没有 IPv6 的内核会直接报错，不用管）
   if [ -e /proc/net/if_inet6 ] && ! ip -6 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "IPv6 专用路由规则丢了，已补回"; fi
   _live_sync
+  # 用着直连标记却很久没握手（比如别的程序改了防火墙）：清掉选择，让网关重启时重新试
+  _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  case "$(st_get EP_MARK)" in ''|off) ;; *)
+    if [ -n "$_hs" ] && { [ "$_hs" = 0 ] || [ $(($(date +%s) - _hs)) -gt 300 ]; }; then
+      st_set EP_MARK ""; log "直连很久没握手，重新选连落地机的路"; return 1
+    fi ;;
+  esac
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
   if [ "$WG_EP_KIND" = name ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
@@ -2264,6 +2319,8 @@ do_update() {
   _svc_before=$(_svc_sum)
   install_services
   [ "$(_svc_sum)" = "$_svc_before" ] || _gw_changed=1
+  # 内核网卡模式还没选过连落地机的路：要重建网卡才能试，这次重启网关
+  [ "$MODE" = kernel ] && [ -z "$(st_get EP_MARK)" ] && _gw_changed=1
   # 3. 网关程序、网关配置、开机服务都没变，而且网关现在是通的：不重启网关，走 WireGuard 的节点一秒都不断。
   #    内核网卡模式只把专用路由规则补齐（缺了才加，不删不重建）。
   #    有变化才重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版。
@@ -2358,7 +2415,7 @@ do_install() {
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
   [ -f "$CONF" ] && cp -p "$CONF" "$CONF.prev"
   mv -f "$_tc" "$CONF"; chmod 600 "$CONF"
-  st_set MODE "$MODE"; st_set REQ_MODE "$_req"; st_set PORTS "$PORTS"; st_set EP_FAM "$EP_FAM"
+  st_set MODE "$MODE"; st_set REQ_MODE "$_req"; st_set PORTS "$PORTS"; st_set EP_FAM "$EP_FAM"; st_set EP_MARK ""
   st_set INIT "$INIT"; st_set VERSION "$WGL_VERSION"
   pick_gateway_ports
   gen_gateway
@@ -2390,7 +2447,7 @@ do_up() { # 网关服务启动前调用：内核网卡模式建网卡，无网�
   if [ "$MODE" = kernel ]; then kernel_up || exit 1
   else
     _has ip && ip link show dev "$WGL_IFACE" >/dev/null 2>&1 && kernel_down
-    _ep_rule_sync
+    _has ip && _ep_rule_del
   fi
   exit 0
 }
@@ -2404,7 +2461,6 @@ do_check() {
   INIT=$(st_get INIT)
   _IN_CHECK=1
   _lock 0 || exit 0
-  _ep_rule_sync
   if gw_active; then
     if [ "$MODE" = kernel ] && ! kernel_ensure; then log "网卡不见了，重启网关"; gw_restart; fi
   else
@@ -2460,7 +2516,7 @@ do_set_conf() { # do_set_conf [文件]：换一份 WireGuard 配置（换钥匙�
   gw_active && _old_ok=$(wg_exit_ip)
   cp -p "$CONF" "$CONF.prev"
   mv -f "$_tc" "$CONF"; chmod 600 "$CONF"
-  st_set EP_FAM "$_new_fam"
+  st_set EP_FAM "$_new_fam"; st_set EP_MARK ""
   if ! write_gw_json "$GW_JSON.new" || ! "$SB" check -c "$GW_JSON.new" >/dev/null 2>&1; then
     mv -f "$CONF.prev" "$CONF"; st_set EP_FAM "$_old_fam"; rm -f "$GW_JSON.new"; _unlock
     die "新配置生成的网关配置没通过检查，已换回旧配置。"
@@ -2503,7 +2559,7 @@ do_mode() { # do_mode auto|kernel|userspace
   # 先按旧模式停掉网关（会拆掉旧网卡），再换配置启动
   case "$INIT" in systemd) systemctl stop wg-luodi.service >/dev/null 2>&1 ;; openrc) rc-service wg-luodi stop >/dev/null 2>&1 ;; *) _gw_kill ;; esac
   _has ip && kernel_down
-  st_set MODE "$MODE"; st_set REQ_MODE "$_req"
+  st_set MODE "$MODE"; st_set REQ_MODE "$_req"; st_set EP_MARK ""
   gen_gateway
   start_and_check_gateway; _rc=$?
   _unlock
