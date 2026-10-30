@@ -133,6 +133,9 @@ class GatewayAndPatchTest(unittest.TestCase):
                 j = json.loads(out.read_text())
                 self.assertEqual(j["inbounds"][0]["listen"], "127.0.0.1")   # 网关只听本机
                 self.assertEqual(j["inbounds"][1]["listen"], "127.0.0.1")
+                for rule in j["route"]["rules"]:                               # 拒绝不能自动变成“悄悄丢掉”
+                    if rule.get("action") == "reject":
+                        self.assertTrue(rule.get("no_drop"))
                 if mode == "kernel":
                     self.assertEqual(j["outbounds"][0]["bind_interface"], "wg-luodi")
                     self.assertNotIn("endpoints", j)
