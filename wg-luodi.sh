@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.5"
+WGL_VERSION="1.1.6"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1099,8 +1099,10 @@ write_gw_json() { # write_gw_json <输出文件>
         rules: (
           [ { inbound: [ "dns-in" ], action: "hijack-dns" } ]
           # 隧道只支持一种 IP 时，另一种 IP 的目标直接拒绝（客户端会马上改用能用的那种），不会走服务器自己的 IP
-          + (if $strat == "ipv4_only" then [ { ip_cidr: [ "::/0" ], action: "reject" } ]
-             elif $strat == "ipv6_only" then [ { ip_cidr: [ "0.0.0.0/0" ], action: "reject" } ]
+          # no_drop：sing-box 默认 30 秒里拒绝超过 50 次就改成“悄悄丢掉”，连接要等超时才失败，
+          # 爱用 IPv6 的设备（比如连着有 IPv6 的 Wi-Fi 的 iPad）就会卡得特别慢；加上它就一直马上拒绝
+          + (if $strat == "ipv4_only" then [ { ip_cidr: [ "::/0" ], action: "reject", no_drop: true } ]
+             elif $strat == "ipv6_only" then [ { ip_cidr: [ "0.0.0.0/0" ], action: "reject", no_drop: true } ]
              else [] end)
         ),
         final: (if $mode == "kernel" then "wg-out" else "wg" end),
