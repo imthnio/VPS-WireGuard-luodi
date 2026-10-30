@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.17"
+WGL_VERSION="1.1.18"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -2032,11 +2032,44 @@ wg_exit_ip() {
   ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)"
 }
 server_ip() { ip_via -4 || ip_via -6; }
-# 测下载速度（Mbps）。超时（30 秒）也照样用已经下载的部分算平均速度。
+# 测下载速度（Mbps）。超时（20 秒）也照样用已经下载的部分算平均速度。
 _speed() { # _speed [curl 参数…]
   _has curl || return 1
-  _b=$(_to 40 curl -sS -o /dev/null -w '%{speed_download}' --connect-timeout 8 --max-time 30 "$@" "$WGL_SPEED_URL" 2>/dev/null)
+  _b=$(_to 30 curl -sS -o /dev/null -w '%{speed_download}' --connect-timeout 8 --max-time 20 "$@" "$WGL_SPEED_URL" 2>/dev/null)
   awk -v b="$_b" 'BEGIN { if (b + 0 <= 0) exit 1; printf "%.1f", b * 8 / 1000000 }'
+}
+# 同时开 N 个连接下载，速度加起来（Mbps）。单个连接受延迟、丢包限制跑不满时，多个连接加起来会明显更快。
+_speed_par() { # _speed_par <N> [curl 参数…]
+  _pn=$1; shift; _pi=0; _pf="$WGL_DIR/speed.$$"
+  rm -f "$_pf".*
+  # 每个结果后面补一个换行：_speed 打印的数字不带换行，几个文件直接连起来会粘成一个数
+  while [ "$_pi" -lt "$_pn" ]; do ( _speed "$@"; echo ) > "$_pf.$_pi" & _pi=$((_pi + 1)); done
+  wait
+  cat "$_pf".* 2>/dev/null | awk '{ s += $1 } END { if (s <= 0) exit 1; printf "%.1f", s }'; _pr=$?
+  rm -f "$_pf".*
+  return $_pr
+}
+# 到 1.1.1.1 的平均延迟（毫秒），ping 的参数（比如 -m 标记）原样传进去。iputils 和 busybox 的输出都认。
+_rtt() { # _rtt [ping 参数…]
+  _has ping || return 1
+  ping -c 4 -i 0.3 -W 2 "$@" 1.1.1.1 2>/dev/null | awk '/min\/avg/ { sub(/.*= */, ""); split($0, a, "/"); if (a[2] + 0 > 0) { printf "%.0f", a[2]; f = 1 } } END { exit !f }'
+}
+# 按测出来的几个数字说清楚瓶颈在哪一段（只做比较，不联网，方便测试）。
+#   参数：直接经 WireGuard 网卡（1 个连接）、同上（4 个连接）、经网关（节点实际走的路）、服务器平时的出口
+_speed_verdict() { # _speed_verdict <raw> <raw4> <gw> <direct>
+  awk -v r="$1" -v r4="$2" -v g="$3" -v d="$4" 'BEGIN {
+    if (g == "" && r == "") { print "经 WireGuard 完全下载不了：先运行 wg-luodi status 看握手和出口"; exit }
+    if (r != "" && g != "" && g < r * 0.7) {
+      print "直接用 WireGuard 网卡快、经网关慢：拖慢的是本机网关程序这一段，多半是 CPU 不够（看上面的负载）"; exit }
+    base = (r != "") ? r : g
+    if (r4 != "" && base != "" && r4 > base * 1.5) {
+      print "单个连接跑不满、4 个连接加起来快很多：是服务器到落地机这段的延迟或丢包限制了每个连接的速度，"
+      print "    落地机本身带宽还有余量。网页、测速软件开多个连接时会快一些，脚本这边没法再提速"; exit }
+    if (d != "" && base != "" && base < d * 0.5) {
+      print "不经过节点和网关、直接用 WireGuard 网卡下载也只有这么快，多开连接也不变："
+      print "    瓶颈在落地机本身的带宽（或服务器到落地机的线路），不是本脚本或 L2TP 造成的，可以找落地机商家确认带宽"; exit }
+    print "WireGuard 和服务器平时的出口速度差不多，这一段没有明显瓶颈"
+  }'
 }
 # 服务器装了 L2TP-VPS（而且没关掉）时，“平时的出口”是 L2TP 的 IP，不是服务器自己的 IP，提示一句免得看糊涂。
 _l2tp_note() {
@@ -2740,22 +2773,41 @@ do_uninstall() {
 }
 
 # 测速：同一个文件，经 WireGuard 和经服务器平时的出口各下载一次，对比速度，顺便说明 WireGuard 走的是哪条路。
+# 测速：一段一段分开测，最后用一句话说清楚慢在哪：
+#   ① 直接用 WireGuard 网卡下载（不经过节点、不经过网关）= 落地机 + 线路本身能跑多快；
+#   ② 同上开 4 个连接 = 落地机总带宽还有没有余量（单个连接是不是被延迟/丢包卡住）；
+#   ③ 经本机网关下载 = 节点实际走的路；④ 服务器平时的出口（装了 L2TP 就是 L2TP）用来对比。
 do_speed() {
   load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
-  step "测速（各下载 25MB，最多各 30 秒）"
-  [ "$MODE" = kernel ] && say "  WireGuard 连落地机走的网卡：$(_ep_dev_show)    隧道 MTU：$(wg_mtu)"
-  gw_active || { err "网关没在运行，测不了 WireGuard 的速度（试试 wg-luodi restart）"; return 1; }
-  say "  正在经 WireGuard 下载…"
-  _w=$(_speed -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)")
-  say "  正在经服务器平时的出口下载…"
-  _d=$(_speed)
-  say "  经 WireGuard（落地机）：${_w:-测不出来} Mbps"
-  say "  服务器平时的出口：${_d:-测不出来} Mbps$(_l2tp_note)"
-  if [ "$MODE" = kernel ] && [ "$(st_get EP_MARK)" = off ] && [ -n "$(_l2tp_note)" ]; then
-    warn "WireGuard 现在套在 L2TP 里面走（每个包包两层），速度不会超过 L2TP。直连没通过检查，详情看 /etc/wg-luodi/log"
-  elif [ -n "$_w" ] && [ -n "$_d" ]; then
-    say "  WireGuard 慢很多、而它走的是服务器自己的网卡时，多半是落地机本身的带宽或线路（服务器到落地机的距离）限制。"
+  step "测速（每项下载 25MB，最多 20 秒，全部测完一两分钟）"
+  if [ "$MODE" = kernel ]; then
+    say "  WireGuard 连落地机走的网卡：$(_ep_dev_show)    隧道 MTU：$(wg_mtu)"
+    [ "$(st_get EP_MARK)" = off ] && [ -n "$(_l2tp_note)" ] && \
+      warn "WireGuard 现在套在 L2TP 里面走（每个包包两层），速度不会超过 L2TP。直连没通过检查，详情看 /etc/wg-luodi/log"
   fi
+  say "  CPU：$(nproc 2>/dev/null || echo '?') 核    当前负载：$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?')"
+  if [ "$MODE" = kernel ]; then _rw=$(_rtt -m "$WGL_MARK"); else _rw=""; fi
+  _rd=$(_rtt)
+  say "  到 1.1.1.1 的延迟：经 WireGuard ${_rw:-测不出来} ms，经服务器平时的出口 ${_rd:-测不出来} ms"
+  gw_active || { err "网关没在运行，测不了 WireGuard 的速度（试试 wg-luodi restart）"; return 1; }
+  _raw=""; _raw4=""
+  if [ "$MODE" = kernel ]; then
+    if [ "$WG_HAS4" = 1 ]; then _fam=-4; else _fam=-6; fi
+    say "  ① 直接用 WireGuard 网卡下载（不经过节点和网关）…"
+    _raw=$(_speed "$_fam" --interface "$WGL_IFACE")
+    say "  ② 同上，同时开 4 个连接…"
+    _raw4=$(_speed_par 4 "$_fam" --interface "$WGL_IFACE")
+  fi
+  say "  ③ 经本机网关下载（节点实际走的路）…"
+  _w=$(_speed -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)")
+  say "  ④ 经服务器平时的出口下载…"
+  _d=$(_speed)
+  say ""
+  [ "$MODE" = kernel ] && say "  ① WireGuard 网卡，1 个连接：${_raw:-测不出来} Mbps" && say "  ② WireGuard 网卡，4 个连接：${_raw4:-测不出来} Mbps"
+  say "  ③ 经网关（节点实际走的路）：${_w:-测不出来} Mbps"
+  say "  ④ 服务器平时的出口：${_d:-测不出来} Mbps$(_l2tp_note)"
+  say ""
+  _speed_verdict "$_raw" "$_raw4" "$_w" "$_d" | sed 's/^/  结论：/; s/^  结论：    /        /'
 }
 
 # ---------- 24. 中文菜单 ----------
