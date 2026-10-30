@@ -218,7 +218,7 @@ class E2E(unittest.TestCase):
         for line in log.splitlines():   # 绝不碰主路由表的默认路由
             if "route" in line and "default" in line and "show" not in line:
                 self.assertIn("table 51888", line)
-        self.assertFalse((sb.etc / "wg-setconf.conf").exists())          # 临时钥匙文件不留
+        self.assertFalse((sb.etc / "wireguard" / "wg-luodi-setconf.conf").exists())          # 临时钥匙文件不留
         gw = json.loads((sb.etc / "gw.json").read_text())
         self.assertEqual(gw["outbounds"][0]["routing_mark"], 51888)
         r = sb.run_cmd(["mode", "userspace"], timeout=300)
