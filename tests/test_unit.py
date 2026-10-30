@@ -213,6 +213,28 @@ class EpMarkTest(unittest.TestCase):
         r = self.sb.source('_to() { shift; "$@"; }; curl() { printf 0; }; _speed || echo NONE')
         self.assertEqual(r.stdout.strip(), "NONE", r.stderr)
 
+    def test_rtt_reads_iputils_and_busybox(self):
+        for line in ("rtt min/avg/max/mdev = 10.1/23.6/30.2/1.1 ms",
+                     "round-trip min/avg/max = 10.1/23.6/30.2 ms"):
+            r = self.sb.source("ping() { echo '%s'; }; _rtt" % line)
+            self.assertEqual(r.stdout, "24", (line, r.stderr))
+        r = self.sb.source("ping() { return 1; }; _rtt || echo NONE")
+        self.assertEqual(r.stdout.strip(), "NONE")
+
+    def test_parallel_speed_adds_up(self):
+        r = self.sb.source('_to() { shift; "$@"; }; curl() { printf 1250000; }; _speed_par 4')
+        self.assertEqual(r.stdout, "40.0", r.stderr)                     # 4 个连接各 10 Mbps
+        self.assertFalse(list(self.sb.etc.glob("speed.*")))               # 临时文件不留
+
+    def test_speed_verdict_names_the_slow_segment(self):
+        def v(*a):
+            return self.sb.source("_speed_verdict %s" % " ".join("'%s'" % x for x in a)).stdout
+        self.assertIn("网关", v("80", "90", "20", "100"))                  # 网卡快、经网关慢：网关/CPU
+        self.assertIn("4 个连接", v("10", "40", "9", "100"))               # 单连接被卡、总带宽有余量
+        self.assertIn("落地机本身的带宽", v("10", "11", "9", "100"))        # 怎么测都慢：落地机
+        self.assertIn("差不多", v("90", "95", "88", "100"))
+        self.assertIn("完全下载不了", v("", "", "", "100"))
+
     def test_l2tp_note(self):
         r = self.sb.source('_l2tp_note', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
         self.assertEqual(r.stdout, "")
