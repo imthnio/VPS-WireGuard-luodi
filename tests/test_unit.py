@@ -122,9 +122,20 @@ class EpMarkTest(unittest.TestCase):
     def tearDown(self):
         self.sb.cleanup()
 
+    L2TP_RULES = ("0:\\tfrom all lookup local\\n8905:\\tfrom all fwmark 0x24680 lookup main\\n"
+                  "8906:\\tfrom all fwmark 0x24682 lookup main\\n8920:\\tfrom all lookup 24680\\n")
+
+    def l2tp(self):
+        d = self.sb.tmp / "l2tp-vless"
+        d.mkdir(exist_ok=True)
+        (d / "v2-owned").write_text("")
+        return {"WGL_L2TP_DIR": str(d), "FAKE_IP_RULES": self.L2TP_RULES}
+
     def test_candidates(self):
-        r = self.sb.source("_ep_cands", {"FAKE_IP_RULES": self.RULES})
-        self.assertEqual(r.stdout.split(), ["51889"], r.stderr)   # 不借用别的程序的直连标记
+        r = self.sb.source("_ep_cands", {"FAKE_IP_RULES": self.RULES, "WGL_L2TP_DIR": str(self.sb.tmp / "none")})
+        self.assertEqual(r.stdout.split(), ["51889"], r.stderr)   # 不借用来历不明的直连标记
+        r = self.sb.source("_ep_cands", self.l2tp())
+        self.assertEqual(r.stdout.split(), ["149122"], r.stderr)  # L2TP-VPS 专门留的直连标记，51889 会被它拦下
 
     def test_epm_states(self):
         for st, mode, want in (("", "kernel", "51889"), ("149122", "kernel", "149122"), ("off", "kernel", "off"),
@@ -140,6 +151,41 @@ class EpMarkTest(unittest.TestCase):
         r = self.sb.source("MODE=kernel; _hs_wait() { return 1; }; _ep_pick; st_get EP_MARK", {"FAKE_NO_HS": "1"})
         self.assertEqual(r.stdout.strip(), "retry", r.stderr)      # 怎么都握不上：之后再试
         self.assertFalse(list((self.sb.etc / "wireguard").glob("*")))   # 临时钥匙文件不留
+
+    def pick(self, extra):
+        (self.sb.etc / "state").write_text("")
+        env = {"WGL_L2TP_DIR": str(self.sb.tmp / "none")}
+        env.update(extra)
+        r = self.sb.source("MODE=kernel; WG_HAS4=1; _ep_pick; st_get EP_MARK; st_get EP_MTU; st_get EP_CHECK; wg_mtu", env)
+        return r.stdout.split(), r
+
+    def test_pick_needs_big_packets_through_l2tp_mark(self):
+        out, r = self.pick(self.l2tp())                                  # 大包能过：用 L2TP 的直连标记
+        self.assertEqual(out, ["149122", "149122:1420", "2", "1420"], r.stderr)
+        out, r = self.pick(dict(self.l2tp(), FAKE_PING_MAX="1300"))     # 路上 MTU 小：调小隧道 MTU 后照样用
+        self.assertEqual(out[:2], ["149122", "149122:1300"], r.stderr)
+        self.assertEqual(out[-1], "1300")
+        out, r = self.pick(dict(self.l2tp(), FAKE_PING_MAX="100"))      # 握手能成、大包过不去：不用这条路
+        self.assertEqual(out[0], "off", r.stderr)
+        self.assertIn("大包过不去", (self.sb.etc / "log").read_text())
+        out, r = self.pick(dict(self.l2tp(), FAKE_NO_PING="1"))         # 没法确认大包：借来的标记不用
+        self.assertEqual(out[0], "off", r.stderr)
+
+    def test_pick_own_mark_without_ping_works_as_before(self):
+        out, r = self.pick({"FAKE_NO_PING": "1"})
+        self.assertEqual(out[0], "51889", r.stderr)
+        out, r = self.pick({"FAKE_PING_MAX": "100"})                    # 自己的标记：大包确定过不去也换路
+        self.assertEqual(out[0], "off", r.stderr)
+
+    def test_old_choice_is_rechecked_once(self):
+        (self.sb.etc / "state").write_text("EP_MARK=off\n")
+        r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
+                           '_live_sync() { :; }; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
+        self.assertEqual(r.stdout.split(), ["rc=1"], r.stderr)          # 让网关重启、重新选路
+        (self.sb.etc / "state").write_text("EP_MARK=off\nEP_CHECK=2\n")
+        r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
+                           '_live_sync() { :; }; WG_EP_KIND=ip; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
+        self.assertEqual(r.stdout.split(), ["rc=0", "off"], r.stderr)
 
 
 @unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")

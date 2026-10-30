@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.13"
+WGL_VERSION="1.1.14"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -93,6 +93,7 @@ WGL_TABLE=${WGL_TABLE:-51888}                     # 内核网卡模式的专用�
 WGL_PREF=${WGL_PREF:-5188}                        # 专用路由规则的优先级
 WGL_EPMARK=${WGL_EPMARK:-51889}                   # WireGuard 自己连落地机的包的标记（首选）
 WGL_EPPREF=${WGL_EPPREF:-5189}                    # “这种包走服务器自己的网卡”规则的优先级
+WGL_L2TP_DIR=${WGL_L2TP_DIR:-/etc/l2tp-vless}      # L2TP-VPS 装好后的目录（用来认出它，见 _ep_cands）
 WGL_WAIT=${WGL_WAIT:-25}                          # 等网关启动最多几秒
 WGL_RAW_URL=${WGL_RAW_URL:-https://raw.githubusercontent.com/imthnio/VPS-WireGuard-luodi/main/wg-luodi.sh}
 GH_MIRRORS=${GH_MIRRORS:-"https://v6.gh-proxy.org/ https://gh.llkk.cc/ https://ghproxy.net/"}
@@ -1083,6 +1084,11 @@ wg_mtu() {
   case "$_nic" in ''|*[!0-9]*) _nic=1500 ;; esac
   case "$_epip" in *:*) _hd=80 ;; *) _hd=60 ;; esac
   [ $((_nic - _hd)) -lt "$_m" ] && _m=$((_nic - _hd))
+  # 这条路实测过大包能过的最大 MTU（见 _mtu_probe），记成“标记:MTU”，只对同一条路有效
+  if [ "$MODE" = kernel ]; then
+    _pin=$(st_get EP_MTU)
+    case "$_pin" in "$(_epm):"*) _pin=${_pin#*:}; [ "$_pin" -lt "$_m" ] 2>/dev/null && _m=$_pin ;; esac
+  fi
   [ "$_m" -lt 1280 ] && _m=1280
   printf '%s' "$_m"
 }
@@ -1226,8 +1232,10 @@ _rules_sync() {
 # 服务器上要是装了 L2TP / WARP 之类“全局出口”（策略路由把所有流量拉走，有的还用防火墙封住直连），
 # WireGuard 的包会被拉进它们，MTU 变小、多绕一层。所以建网卡时先试：
 #   ① 本脚本的标记 51889 + 一条“带它的查主路由表”的规则（优先级 5189，排在它们前面）；
-#   ② 握不上手（比如那类工具的防火墙封了直连）：不打标记，走服务器默认的路（和以前一样），MTU 按那条路自动调小。
-# 不借用别的程序留的“直连标记”：实测在 L2TP 全局出口上握手能成功，但网页打不开。
+#      服务器装了 L2TP-VPS 时改用它专门留给别的程序直连的标记 0x24682（它的防火墙只放行这个，51889 一定被拦）；
+#   ② 都不行：不打标记，走服务器默认的路（和以前一样），MTU 按那条路自动调小。
+# 一条路“能用”要同时满足：能握手，而且大包也能过（见 _mtu_probe）。只看握手不够：握手包只有 148 字节，
+# 以前就出现过借用 L2TP 的直连标记握手成功、延迟正常、网页却打不开的情况。
 # 选好的记在状态里（EP_MARK），以后直接用；别的程序的规则和防火墙一条都不动。
 # EP_MARK：空 = 还没选；数字 = 用这个标记；off = 直连都不通，走默认的路；
 #          retry = 试的时候落地机怎么都握不上手（多半是落地机暂时不在线），先走默认的路，巡检时再试。
@@ -1252,8 +1260,36 @@ _ep_rule_del() {
   done
   return 0
 }
-# 要试的标记（以后要加候选就加在这里）
-_ep_cands() { echo "$WGL_EPMARK"; }
+# 要试的标记。装了 L2TP-VPS 的服务器只试它的直连标记 0x24682（十进制 149122）：
+# 它的路由规则 8906 一直都在、防火墙放行带这个标记的包；本脚本的 51889 会被它的断线保护拦下，白等 8 秒。
+_ep_cands() {
+  if [ -f "$WGL_L2TP_DIR/v2-owned" ] && ip -"${EP_FAM:-4}" rule show pref 8906 2>/dev/null | grep -q 'fwmark 0x24682 lookup main'; then
+    echo 149122
+  else
+    echo "$WGL_EPMARK"
+  fi
+}
+# 经隧道 ping 1.1.1.1（带专用标记，走 wg-luodi 网卡；-M do 禁止分片），包大小 = $1 字节的数据。
+_ping_tun() { ping -c 3 -i 0.2 -W 1 -m "$WGL_MARK" -M do -s "$1" 1.1.1.1 >/dev/null 2>&1; }
+# 这条路大包能不能过。从按网卡算出的 MTU 往下试，找出真能过的最大 MTU，记在 EP_MTU（“标记:MTU”）。
+# 返回 0：找到了；1：小包能过、大包都过不去（这条路传不了网页）；
+#      2：判断不了（没有支持 -M/-m 的 ping，比如 Alpine 的 busybox；落地不回 ping；隧道没有 IPv4）。
+_mtu_probe() {
+  [ "$WG_HAS4" = 1 ] && _has ping || return 2
+  ping -c 1 -W 1 -M do -s 16 127.0.0.1 >/dev/null 2>&1 || return 2
+  _pm=$(_epm); _top=$(wg_mtu)
+  ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
+  _ping_tun 56 || return 2
+  for _s in "$_top" 1400 1380 1340 1300 1280; do
+    [ "$_s" -le "$_top" ] || continue
+    if _ping_tun $((_s - 28)); then
+      st_set EP_MTU "$_pm:$_s"
+      [ "$_s" = "$_top" ] || log "这条路大包只能过 $_s，隧道 MTU 调成 $_s"
+      return 0
+    fi
+  done
+  return 1
+}
 # 把 WireGuard 配置（带标记）装进网卡。setconf 会把对端重建一遍，马上重新握手，正好用来试一条路。
 _wg_load() { # _wg_load <标记|off>
   mkdir -p "$WGL_WGDIR" && chmod 700 "$WGL_WGDIR"
@@ -1273,22 +1309,31 @@ _hs_wait() { # _hs_wait <秒>：这么多秒内和落地机握上手返回 0
   return 1
 }
 _ep_pick() {
+  st_set EP_MTU ""
   for EPM_TRY in $(_ep_cands); do
     [ "$EPM_TRY" = "$WGL_EPMARK" ] && _ep_rule_sync
     _wg_load "$EPM_TRY" >/dev/null 2>&1 || continue
-    if _hs_wait 8; then
+    _hs_wait 8 || continue
+    _mtu_probe; _pr=$?
+    # 本脚本自己的标记：判断不了大包时照旧用（和以前一样）；借用 L2TP 的直连标记：必须确认大包能过才用。
+    if [ "$_pr" = 0 ] || { [ "$_pr" = 2 ] && [ "$EPM_TRY" = "$WGL_EPMARK" ]; }; then
       [ "$EPM_TRY" = "$WGL_EPMARK" ] || _ep_rule_del
-      st_set EP_MARK "$EPM_TRY"; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
+      st_set EP_MARK "$EPM_TRY"; st_set EP_CHECK 2; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
       EPM_TRY=""; return 0
     fi
+    st_set EP_MTU ""
+    if [ "$_pr" = 1 ]; then log "标记 $EPM_TRY 能握手，但大包过不去，不用这条路"
+    else log "标记 $EPM_TRY 能握手，但没法确认大包能过（落地不回 ping），不用这条路"; fi
   done
   _ep_rule_del
   EPM_TRY=off; _wg_load off
   if _hs_wait 8; then
-    st_set EP_MARK off; log "直连握不上手，连落地机走服务器默认的路（$(_ep_dev_show)）"
+    _mtu_probe
+    st_set EP_MARK off; log "直连不可用，连落地机走服务器默认的路（$(_ep_dev_show)）"
   else
     st_set EP_MARK retry; log "落地机怎么都握不上手（可能暂时不在线），先走默认的路，巡检时再试"
   fi
+  st_set EP_CHECK 2
   EPM_TRY=""
   return 0
 }
@@ -1334,6 +1379,10 @@ kernel_ensure() {
   _live_sync
   # 用着直连标记却很久没握手（比如别的程序改了防火墙）：清掉选择，让网关重启时重新试
   _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  # 1.1.13 及以前选路只看握手、没试过大包：升级后重新选一次（网关重启，隧道会短暂重连一次）
+  case "$(st_get EP_MARK)" in ''|retry) ;; *)
+    if [ "$(st_get EP_CHECK)" != 2 ]; then st_set EP_MARK ""; log "按新办法（握手 + 大包都要通）重新选一次连落地机的路"; return 1; fi ;;
+  esac
   # 上次没选成（retry）也在这里重试：这时隧道本来就不通，重启网关不影响什么
   case "$(st_get EP_MARK)" in off) ;; *)
     if [ -n "$_hs" ] && { [ "$_hs" = 0 ] || [ $(($(date +%s) - _hs)) -gt 300 ]; }; then
