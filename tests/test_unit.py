@@ -177,6 +177,15 @@ class EpMarkTest(unittest.TestCase):
         out, r = self.pick({"FAKE_PING_MAX": "100"})                    # 自己的标记：大包确定过不去也换路
         self.assertEqual(out[0], "off", r.stderr)
 
+    def test_picking_marker(self):
+        r = self.sb.source('echo $$ > "$WGL_DIR/picking"; gw_picking && echo YES')
+        self.assertEqual(r.stdout.strip(), "YES", r.stderr)              # 选路的进程还活着：正在启动
+        (self.sb.etc / "picking").write_text("999999\n")
+        r = self.sb.source('gw_picking && echo YES || echo NO')
+        self.assertEqual(r.stdout.strip(), "NO", r.stderr)               # 进程没了（被杀了）：不算
+        r = self.sb.source('rm -f "$WGL_DIR/picking"; gw_picking && echo YES || echo NO')
+        self.assertEqual(r.stdout.strip(), "NO", r.stderr)
+
     def test_old_choice_is_rechecked_once(self):
         (self.sb.etc / "state").write_text("EP_MARK=off\n")
         r = self.sb.source('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '

@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.14"
+WGL_VERSION="1.1.15"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1355,7 +1355,12 @@ kernel_up() {
   ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" up || { ip link del dev "$WGL_IFACE"; return 1; }
   _rules_add
   # 还没选过连落地机的路：现在试（第一次装、更新、换配置、换模式后）
-  case "$(st_get EP_MARK)" in ''|retry) _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null ;; esac
+  # 选路时留一个标记文件（里面是进程号）：状态页能显示“正在选路”，巡检也不会把正在启动的网关当成挂了去重启。
+  case "$(st_get EP_MARK)" in ''|retry)
+    echo $$ > "$WGL_DIR/picking"
+    _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null
+    rm -f "$WGL_DIR/picking" ;;
+  esac
   log "内核网卡 $WGL_IFACE 已建好"
 }
 
@@ -1811,6 +1816,8 @@ ExecStart=$SB run -c $GW_JSON
 ExecStopPost=-$WGL_CMD down
 Restart=always
 RestartSec=5
+# 启动前要选连落地机的路（握手 + 试大包），网络慢时可能超过默认的 90 秒
+TimeoutStartSec=180
 LimitNOFILE=1048576
 
 [Install]
@@ -1956,6 +1963,8 @@ gw_restart() {
       echo $! > "$WGL_DIR/gw.pid" ;;
   esac
 }
+# 网关正在启动、还在选连落地机的路（kernel_up 里，最多一分钟左右）
+gw_picking() { [ -f "$WGL_DIR/picking" ] && kill -0 "$(cat "$WGL_DIR/picking" 2>/dev/null)" 2>/dev/null; }
 gw_active() {
   case "$INIT" in
     systemd) systemctl is-active --quiet wg-luodi.service ;;
@@ -2041,9 +2050,11 @@ do_status() {
   esac
   say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
   say "  隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)$( [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in
-      off) echo "（直连不通，走服务器默认的路）" ;; ''|retry) echo "（还没选好，巡检时会再试）" ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
+      off) echo "（直连不通，走服务器默认的路）" ;; ''|retry) if gw_picking; then echo "（正在选路）"; else echo "（还没选好，巡检时会再试）"; fi ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
   say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
-  if gw_active; then say "  网关服务：运行中"; else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
+  if gw_active; then say "  网关服务：运行中"
+  elif gw_picking; then say "  网关服务：正在启动（正在选连落地机的路，最多一分钟左右）"
+  else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
   if [ "$MODE" = kernel ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     if [ -n "$_hs" ] && [ "$_hs" != 0 ]; then say "  最近握手：$(( $(date +%s) - _hs )) 秒前（3 分钟内都正常）"
@@ -2053,6 +2064,9 @@ do_status() {
   detect_net
   v6_report
   say ""
+  if gw_picking && ! gw_active; then
+    say "  网关正在启动，出口 IP 等它好了再测：过一分钟再运行 wg-luodi status"
+  else
   say "  正在测出口 IP（要十几秒）…"
   _sip=$(server_ip); _wip=$(wg_exit_ip)
   say "  服务器自己的 IP：${_sip:-没测出来}"
@@ -2062,6 +2076,7 @@ do_status() {
     else warn "WireGuard 出口 IP 和服务器 IP 一样，请检查落地配置。"; fi
   else
     err "通过 WireGuard 访问不了外网。可能原因：配置失效（换了钥匙？）、落地机连不上、或服务器屏蔽了 UDP。"
+  fi
   fi
   say ""
   say "  节点情况："
@@ -2514,7 +2529,9 @@ do_check() {
   _IN_CHECK=1
   _lock 0 || exit 0
   if gw_active; then
-    if [ "$MODE" = kernel ] && ! kernel_ensure; then log "网卡不见了，重启网关"; gw_restart; fi
+    if [ "$MODE" = kernel ] && ! kernel_ensure; then log "要重建网卡（网卡不见了或要重新选路），重启网关"; gw_restart; fi
+  elif gw_picking; then
+    log "网关正在启动（选路中），这次巡检不重启它"
   else
     log "网关没在运行，重新启动"; gw_restart
   fi
