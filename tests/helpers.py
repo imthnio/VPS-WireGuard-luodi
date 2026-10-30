@@ -104,6 +104,18 @@ esac
 exit 0
 '''
 
+# 假 ping：只记日志。FAKE_NO_PING=1 时一个都不回（相当于落地不回 ping）；
+# FAKE_PING_MAX=N 时数据超过 N 字节的包过不去（相当于路上 MTU 不够）；ping 127.0.0.1 总是通（相当于 iputils 的 ping）。
+FAKE_PING = r'''#!/bin/sh
+echo "ping $*" >> "$FAKE_LOG"
+size=56; prev=""
+for a in "$@"; do [ "$prev" = -s ] && size=$a; prev=$a; done
+case " $* " in *" 127.0.0.1 "*) exit 0 ;; esac
+[ "$FAKE_NO_PING" = 1 ] && exit 1
+[ -n "$FAKE_PING_MAX" ] && [ "$size" -gt "$FAKE_PING_MAX" ] && exit 1
+exit 0
+'''
+
 FAKE_FAIL = r'''#!/bin/sh
 echo "$(basename "$0") $*" >> "$FAKE_LOG"
 exit 1
@@ -207,7 +219,7 @@ class Sandbox:
         self.tmp = Path(tempfile.mkdtemp(prefix="wgl-test-", dir=os.environ.get("WGL_TEST_TMP")))
         self.stubs = self.tmp / "stubs"
         self.stubs.mkdir()
-        for name, body in (("ip", FAKE_IP), ("wg", FAKE_WG), ("modprobe", FAKE_LOGONLY),
+        for name, body in (("ip", FAKE_IP), ("wg", FAKE_WG), ("ping", FAKE_PING), ("modprobe", FAKE_LOGONLY),
                            ("sysctl", FAKE_LOGONLY), ("rc-update", FAKE_LOGONLY), ("openrc-run", FAKE_LOGONLY),
                            ("apt-get", FAKE_FAIL), ("apk", FAKE_FAIL), ("dnf", FAKE_FAIL), ("yum", FAKE_FAIL),
                            ("systemctl", FAKE_FAIL), ("rc-service", FAKE_RC_SERVICE),
