@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.19"
+WGL_VERSION="1.1.20"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -1430,6 +1430,11 @@ kernel_ensure() {
       st_set EP_MARK ""; log "连落地机很久没握手，重新选路"; return 1
     fi ;;
   esac
+  # retry 时走的是默认的路（装了 L2TP 就是套在 L2TP 里），大包也没试过。落地机回来后在这条路上又握上了手，
+  # 上面“很久没握手”就不成立了，以前会一直停在这条路上：现在握上手就重新选一次（网关重启一次）。
+  if [ "$(st_get EP_MARK)" = retry ] && [ -n "$_hs" ] && [ "$_hs" != 0 ]; then
+    st_set EP_MARK ""; log "落地机又能握手了，重新选一次连落地机的路"; return 1
+  fi
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
   if [ "$WG_EP_KIND" = name ] && _has wg; then
     _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')

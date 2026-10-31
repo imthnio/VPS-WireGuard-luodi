@@ -272,6 +272,21 @@ class EpMarkTest(unittest.TestCase):
                            '_live_sync() { :; }; WG_EP_KIND=ip; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
         self.assertEqual(r.stdout.split(), ["rc=0", "off"], r.stderr)
 
+    def test_retry_is_repicked_once_landing_is_back(self):
+        # 落地机掉线时记成 retry、先走默认的路；落地机回来后在默认的路上又握上了手，
+        # 以前因为“最近有握手”就不再选路，一直套在 L2TP 里走、大包也没试过。
+        stub = ('MODE=kernel; ip() { case "$*" in "link show"*) return 0;; *"rule show"*) echo "lookup 51888";; *"route show"*) echo default;; esac; }; '
+                '_live_sync() { :; }; WG_EP_KIND=ip; wg() { printf "peer\\t%s\\n" "$HS"; }; ')
+        (self.sb.etc / "state").write_text("EP_MARK=retry\nEP_CHECK=3\n")
+        r = self.sb.source(stub + 'HS=$(($(date +%s) - 10)); kernel_ensure; echo "rc=$?"; st_get EP_MARK')
+        self.assertEqual(r.stdout.split(), ["rc=1"], r.stderr)          # 握上了：重启网关、重新选路
+        (self.sb.etc / "state").write_text("EP_MARK=retry\nEP_CHECK=3\n")
+        r = self.sb.source(stub + 'HS=0; kernel_ensure; echo "rc=$?"; st_get EP_MARK')
+        self.assertEqual(r.stdout.split(), ["rc=1"], r.stderr)          # 还是没握手：照旧重试
+        (self.sb.etc / "state").write_text("EP_MARK=149122\nEP_CHECK=3\n")
+        r = self.sb.source(stub + 'HS=$(($(date +%s) - 10)); kernel_ensure; echo "rc=$?"; st_get EP_MARK')
+        self.assertEqual(r.stdout.split(), ["rc=0", "149122"], r.stderr)   # 已经选好的不动
+
 
 @unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")
 class GatewayAndPatchTest(unittest.TestCase):
