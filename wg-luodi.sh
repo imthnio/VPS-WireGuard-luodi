@@ -75,7 +75,7 @@ export PATH
 # 本脚本写出的文件默认只有 root 能读（里面有钥匙）。
 umask 077
 
-WGL_VERSION="1.1.20"
+WGL_VERSION="1.2.0"
 
 # ---------- 1. 文件放在哪里 ----------
 # 所有路径都能用同名环境变量改（测试时用），正常使用不用管。
@@ -104,6 +104,7 @@ SB_FALLBACK_VER="1.14.2"
 
 STATE="$WGL_DIR/state"
 CONF="$WGL_DIR/wg.conf"
+LANDINGS_DIR="$WGL_DIR/landings"        # 多个落地，每个一个子目录（见第 4b 节）
 GW_JSON="$WGL_DIR/gw.json"
 REG="$WGL_DIR/patched"
 SB="$WGL_LIB/sing-box"
@@ -196,7 +197,239 @@ st_set() { # st_set <名字> <值>（值里只允许字母数字和 . : / _ - �
   { [ -f "$STATE" ] && grep -v "^$1=" "$STATE"; printf '%s=%s\n' "$1" "$2"; } > "$_sf" && mv -f "$_sf" "$STATE"
   chmod 600 "$STATE"
 }
-installed() { [ -f "$STATE" ] && [ -f "$CONF" ]; }
+installed() { [ -f "$STATE" ] && { [ -f "$CONF" ] || [ -n "$(_landing_names)" ]; }; }
+
+# ---------- 4b. 落地（多份 WireGuard 配置） ----------
+# 一个“落地”就是一份 WireGuard 配置（一个国家/地区，比如 us、uk、sg）。
+# 每个落地单独一个目录：$WGL_DIR/landings/<名字>/，里面有 wg.conf 和 state。
+# 落地自己的 state 记：PORTS（走这个落地的节点端口）、EP_FAM、EP_MARK（连落地机用的标记）、
+# SOCKS_PORT、DNS_PORT（这个落地的网关端口）；SOCKS_USER/PASS 所有落地共用，记在全局 state 里。
+# 全局 state 里的 LANDINGS 记所有落地的名字（空格分隔，第一个是默认落地）。
+# 名字只允许小写字母、数字、连字符，最多 12 个字符（网卡名 wg-<名字> 最长 15 个字符，Linux 网卡名上限 16）。
+_landing_valid() { # _landing_valid <名字>：小写字母、数字、连字符，最多 12 个字符，且至少含一个字母（全是数字会和端口分不清）
+  case "$1" in ''|*[!a-z0-9-]*) return 1 ;; esac
+  case "$1" in *[a-z]*) ;; *) return 1 ;; esac
+  [ "${#1}" -le 12 ]
+}
+_landing_dir() { printf '%s/%s' "$LANDINGS_DIR" "$1"; }   # _landing_dir <名字> -> 目录
+_landing_names() { # 所有落地名字（按 LANDINGS 里的顺序；没记时按目录里的来）
+  _ns=$(st_get LANDINGS)
+  _out=""
+  if [ -n "$_ns" ]; then
+    for _n in $_ns; do
+      _landing_valid "$_n" || continue
+      _out="$_out $_n"
+    done
+  else
+    for _d in "$LANDINGS_DIR"/*/; do
+      [ -d "$_d" ] || continue
+      _b=${_d%/}; _b=${_b##*/}
+      _landing_valid "$_b" || continue
+      [ -f "$_d/wg.conf" ] || continue
+      _out="$_out $_b"
+    done
+  fi
+  printf '%s' "${_out# }"
+}
+_landing_index() { # _landing_index <名字> -> 0 起的序号（按 LANDINGS 顺序；空名字是 0，不在列表里排最后）
+  [ -z "$1" ] && { printf 0; return 0; }
+  _i=0
+  for _n in $(_landing_names); do
+    [ "$_n" = "$1" ] && { printf '%s' "$_i"; return 0; }
+    _i=$((_i + 1))
+  done
+  printf '%s' "$_i"
+}
+# 内核网卡模式每落地一套：包标记、路由表、规则优先级、连落地机的标记都从基准值起按序号递增，
+# 这样几个落地互不干扰；第一个落地（序号 0）用的就是以前的 51888/51888/5188/51889。
+_landing_mark() { printf '%s' $((WGL_MARK + $(_landing_index "$1"))); }
+_landing_table() { printf '%s' $((WGL_TABLE + $(_landing_index "$1"))); }
+_landing_pref() { printf '%s' $((WGL_PREF + $(_landing_index "$1"))); }
+_landing_epmark() { printf '%s' $((WGL_EPMARK + $(_landing_index "$1"))); }
+_landing_iface() { # _landing_iface <名字>：空名字 = 老布局的 wg-luodi
+  [ -n "$1" ] && printf 'wg-%s' "$1" || printf '%s' "$WGL_IFACE"
+}
+# 读/写某落地的 state（和全局的 st_get/st_set 同款格式）
+_lst_get() { # _lst_get <落地> <名字>
+  _landing_valid "$1" || return 1
+  _lf="$(_landing_dir "$1")/state"
+  [ -f "$_lf" ] || return 0
+  sed -n "s/^$2=//p" "$_lf" | head -n 1
+}
+_lst_set() { # _lst_set <落地> <名字> <值>（值里只允许字母数字和 . : / _ - 空格）
+  _landing_valid "$1" || die "内部错误：落地名字不合法：$1"
+  case "$3" in *[!A-Za-z0-9.:/_\ -]*) die "内部错误：状态值不合法：$2" ;; esac
+  _ld=$(_landing_dir "$1"); mkdir -p "$_ld" && chmod 700 "$_ld"
+  _sf="$_ld/state.tmp.$$"
+  { [ -f "$_ld/state" ] && grep -v "^$2=" "$_ld/state"; printf '%s=%s\n' "$2" "$3"; } > "$_sf" && mv -f "$_sf" "$_ld/state"
+  chmod 600 "$_ld/state"
+}
+# 读某个落地的状态：落地 state 里没有就读全局 state（老布局、或测试直接拼的状态）
+_lget() { # _lget <落地> <名字>
+  _v=$(_lst_get "$1" "$2")
+  if [ -n "$_v" ]; then printf '%s' "$_v"; else st_get "$2"; fi
+}
+# 写某个落地的状态：落地目录存在就写落地，否则写全局
+_lset() { # _lset <落地> <名字> <值>
+  if [ -n "$1" ] && [ -d "$(_landing_dir "$1")" ]; then _lst_set "$1" "$2" "$3"; else st_set "$2" "$3"; fi
+}
+# 读出所有落地名字到 LANDINGS（第一个是默认落地）
+load_landings() {
+  LANDINGS=$(_landing_names)
+}
+# 把某落地的配置读进 WG_* 变量，设置 LND/EP_FAM/EP_STRAT（空名字 = 老布局：不解析配置，用已经读好的 WG_*）
+_lnd_load() { # _lnd_load <名字>
+  LND="$1"
+  if [ -n "$1" ]; then
+    _landing_valid "$1" || return 1
+    parse_conf "$(_landing_dir "$1")/wg.conf" || return 1
+    EP_FAM=$(_lst_get "$1" EP_FAM)
+  else
+    EP_FAM=$(st_get EP_FAM)
+  fi
+  [ "$EP_FAM" = 6 ] && EP_STRAT=ipv6_only || EP_STRAT=ipv4_only
+}
+# 从全局 state 里删掉一键（迁移后清理老键用）
+_st_del() { # _st_del <名字>
+  [ -f "$STATE" ] || return 0
+  grep -v "^$1=" "$STATE" > "$STATE.tmp.$$" 2>/dev/null || true
+  mv -f "$STATE.tmp.$$" "$STATE" 2>/dev/null
+}
+# 所有落地端口的并集（去重、从小到大；没落地时读全局 PORTS，老布局用）
+_all_ports() {
+  _ns=$(_landing_names)
+  if [ -z "$_ns" ]; then printf '%s' "$(st_get PORTS)"; return 0; fi
+  _ap=""
+  for _n in $_ns; do _ap="$_ap $(_lst_get "$_n" PORTS)"; done
+  printf '%s\n' $_ap | grep -E '^[0-9]+$' | sort -n -u | tr '\n' ' ' | sed 's/ $//'
+}
+# 某个端口属于哪个落地（没有返回空；老布局也没有落地）
+_port_landing() { # _port_landing <端口>
+  for _n in $(_landing_names); do
+    case " $(_lst_get "$_n" PORTS) " in *" $1 "*) printf '%s' "$_n"; return 0 ;; esac
+  done
+  return 0
+}
+# 端口列表 -> “端口:落地”映射（老布局的落地为空，比如 31001:）
+_port_map() { # _port_map <端口…>
+  _pm=""
+  for _p in "$@"; do _pm="$_pm $_p:$(_port_landing "$_p")"; done
+  printf '%s' "${_pm# }"
+}
+# 所有落地的网关端口（SOCKS + DNS，老布局的全局端口也算上）：节点端口不能和它们撞上
+_gateway_ports_all() {
+  _gp="$(st_get SOCKS_PORT) $(st_get DNS_PORT)"
+  for _n in $(_landing_names); do _gp="$_gp $(_lst_get "$_n" SOCKS_PORT) $(_lst_get "$_n" DNS_PORT)"; done
+  printf '%s' "$_gp"
+}
+# 节点配置里某个落地的出站 tag（老布局没有落地后缀）
+_ob_tag() { # _ob_tag <落地>
+  [ -n "$1" ] && printf 'wg-luodi-%s' "$1" || printf 'wg-luodi'
+}
+# 映射说成人话：“端口 31001 走 us，端口 31002 走 uk”（老布局：端口 31001 31002）
+_map_msg() { # _map_msg <映射>
+  _mm=""; _lp=""
+  for _pr in $1; do
+    _pp=${_pr%%:*}; _ll=${_pr#*:}; [ "$_pp" = "$_pr" ] && _ll=""
+    [ -z "$_ll" ] && _lp="$_lp $_pp"
+  done
+  [ -n "$_lp" ] && _mm="端口${_lp}"
+  for _n in $(_landing_names); do
+    _ps=""
+    for _pr in $1; do _pp=${_pr%%:*}; _ll=${_pr#*:}; [ "$_ll" = "$_n" ] && _ps="$_ps $_pp"; done
+    [ -n "$_ps" ] && _mm="${_mm:+$_mm，}端口${_ps} 走 $_n"
+  done
+  printf '%s' "$_mm"
+}
+# 各落地端口说成人话：“us：31001；uk：31002”（老布局：全局 PORTS）
+_landings_ports_text() {
+  _ns=$(_landing_names)
+  if [ -z "$_ns" ]; then printf '%s' "$(st_get PORTS)"; return 0; fi
+  _t=""
+  for _n in $_ns; do _t="$_t；$_n：$(_lst_get "$_n" PORTS)"; done
+  printf '%s' "${_t#；}"
+}
+# 落地名字说成人话：“us、uk、sg”（老布局：老布局）
+_landings_names_text() {
+  _ns=$(_landing_names)
+  if [ -n "$_ns" ]; then printf '%s' "$_ns" | tr ' ' '、'; else printf '老布局'; fi
+}
+# 解析命令里的落地参数：结果在 RL_LANDING。
+# 返回 0 = 定下来了（参数就是落地名；没给参数、只有一个落地时用那个；没落地时是老布局 ""）；
+# 返回 1 = 给了参数但不是落地名；返回 2 = 多个落地又没给参数（调用方问用户或报错）。
+_resolve_landing() { # _resolve_landing <参数>
+  RL_LANDING=""
+  if [ -n "$1" ]; then
+    case " $(_landing_names) " in *" $1 "*) RL_LANDING="$1"; return 0 ;; *) return 1 ;; esac
+  fi
+  _ns=$(_landing_names)
+  if [ -z "$_ns" ]; then RL_LANDING=""; return 0; fi
+  case "$_ns" in *' '*) return 2 ;; *) RL_LANDING="$_ns"; return 0 ;; esac
+}
+# 多个落地时让你选一个（结果在 RL_LANDING；3 次选不对就停）
+_pick_landing() { # _pick_landing <做什么，比如“加端口”>
+  _tries=0
+  while :; do
+    _tries=$((_tries + 1))
+    ask "要操作哪个落地？（$1，现在有：$(_landings_names_text)）" "${LANDINGS%% *}"
+    case " $(_landing_names) " in *" $ANS "*) RL_LANDING="$ANS"; return 0 ;; esac
+    err "没有落地 $ANS。"
+    [ "$_tries" -ge 3 ] && die "试了 3 次都不对，已停止。"
+  done
+}
+# 这些端口能不能用：已经属于别的落地的、或是任何落地的网关端口的，都不行
+_check_ports_free() { # _check_ports_free <除外落地> <端口…>
+  _ex="$1"; shift
+  for _p in "$@"; do
+    _ow=$(_port_landing "$_p")
+    if [ -n "$_ow" ] && [ "$_ow" != "$_ex" ]; then
+      die "端口 $_p 已经在走落地 $_ow。先把它从那边去掉：wg-luodi del-port $_ow $_p"
+    fi
+    case " $(_gateway_ports_all) " in *" $_p "*) die "端口 $_p 是本机网关自己在用的，不能当节点端口。" ;; esac
+  done
+}
+# 老布局（一份 WireGuard 配置在 $WGL_DIR/wg.conf，端口、网关端口记在全局 state 里）
+# 第一次遇到新版脚本时，迁成一个叫 default 的落地；以后再遇到就不动了（幂等）。
+# 老 wg.conf 留一份 .prev 备份；全局 state 里的旧键迁完就删掉（以后只看落地里的）。
+migrate_legacy() {
+  if [ -d "$LANDINGS_DIR" ]; then
+    # 已经有落地、但全局 state 里没记名字（比如更新回滚把旧 state 换回来了）：按目录补上
+    if [ -z "$(st_get LANDINGS)" ]; then
+      _ns=$(_landing_names)
+      [ -n "$_ns" ] && st_set LANDINGS "$_ns"
+    fi
+    return 0
+  fi
+  [ -f "$CONF" ] || return 0
+  for _k in PORTS SOCKS_PORT DNS_PORT EP_FAM EP_MARK; do
+    grep -q "^$_k=" "$STATE" 2>/dev/null || return 0
+  done
+  mkdir -p "$(_landing_dir default)" && chmod 700 "$(_landing_dir default)"
+  cp -p "$CONF" "$(_landing_dir default)/wg.conf"; chmod 600 "$(_landing_dir default)/wg.conf"
+  cp -p "$CONF" "$CONF.prev"; chmod 600 "$CONF.prev"
+  for _k in PORTS EP_FAM EP_MARK SOCKS_PORT DNS_PORT EP_MTU EP_CHECK; do
+    grep -q "^$_k=" "$STATE" 2>/dev/null || continue
+    _lst_set default "$_k" "$(st_get "$_k")"
+  done
+  st_set LANDINGS default
+  for _k in PORTS EP_FAM EP_MARK SOCKS_PORT DNS_PORT EP_MTU EP_CHECK; do _st_del "$_k"; done
+  log "已迁移到多落地布局：原来的配置变成落地 default"
+  # 网关配置按新布局重新生成（网卡名从 wg-luodi 变成 wg-default，旧 gw.json 里的绑定就对不上了）：
+  # 生成不了（比如没有 jq）就保留旧的，下次更新时再生成。
+  if find_jq 2>/dev/null; then
+    MODE=$(st_get MODE)
+    if write_gw_json "$GW_JSON.new" 2>/dev/null; then
+      if [ -x "$SB" ] && ! "$SB" check -c "$GW_JSON.new" >/dev/null 2>&1; then
+        rm -f "$GW_JSON.new"; log "迁移后网关配置没通过检查，保留旧的 gw.json"
+      else
+        mv -f "$GW_JSON.new" "$GW_JSON"; chmod 600 "$GW_JSON"
+      fi
+    else
+      rm -f "$GW_JSON.new"
+    fi
+  fi
+  return 0
+}
 
 # ---------- 5. 加锁 ----------
 # 巡检、节点启动时的钩子、你手动操作可能同时发生，同一时间只让一个去改节点配置。
@@ -766,7 +999,7 @@ parse_ports() { # parse_ports "输入" -> PORTS_OUT（空格分隔、去重、�
   PORTS_OUT=$(printf '%s\n' $_list | sort -n -u | tr '\n' ' ' | sed 's/ $//')
 }
 
-get_ports() {
+get_ports() { # get_ports [默认端口]：WG_PORTS 环境变量优先；否则让你输入
   if [ -n "$WG_PORTS" ]; then
     parse_ports "$WG_PORTS" || die "WG_PORTS 不对：$PARSE_ERR"
     PORTS="$PORTS_OUT"; return 0
@@ -774,7 +1007,7 @@ get_ports() {
   _can_ask || die "现在不是交互终端，又没有给 WG_PORTS。"
   say ""
   say "请输入你要用来搭节点的端口。之后你自己在这些端口上搭节点，节点会自动走 WireGuard。"
-  _def=$(st_get PORTS)
+  _def=${1:-}
   while :; do
     ask "要设置的端口是？可以填多个，用空格隔开（例如 45192 50000）" "$_def"
     if parse_ports "$ANS"; then PORTS="$PORTS_OUT"; break; fi
@@ -1083,13 +1316,13 @@ wg_mtu() {
   _dev=""
   [ -n "$_epip" ] && _has ip && _dev=$(ip route get "$_epip" $(_epm_arg) 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
   _nic=""
-  [ -n "$_dev" ] && [ "$_dev" != "$WGL_IFACE" ] && _nic=$(cat "/sys/class/net/$_dev/mtu" 2>/dev/null)
+  [ -n "$_dev" ] && [ "$_dev" != "$(_landing_iface "$LND")" ] && _nic=$(cat "/sys/class/net/$_dev/mtu" 2>/dev/null)
   case "$_nic" in ''|*[!0-9]*) _nic=1500 ;; esac
   case "$_epip" in *:*) _hd=80 ;; *) _hd=60 ;; esac
   [ $((_nic - _hd)) -lt "$_m" ] && _m=$((_nic - _hd))
   # 这条路实测过大包能过的最大 MTU（见 _mtu_probe），记成“标记:MTU”，只对同一条路有效
   if [ "$MODE" = kernel ]; then
-    _pin=$(st_get EP_MTU)
+    _pin=$(_lget "$LND" EP_MTU)
     case "$_pin" in "$(_epm):"*) _pin=${_pin#*:}; [ "$_pin" -lt "$_m" ] 2>/dev/null && _m=$_pin ;; esac
   fi
   [ "$_m" -lt 1280 ] && _m=1280
@@ -1105,86 +1338,149 @@ _ep_dev_show() { # 状态页用：WireGuard 连落地机实际走哪张网卡
 }
 # 内核网卡模式：不重建网卡，原地补齐“连落地机走服务器自己网卡”的规则，MTU 不对就改（不断流）。
 # 网关配置里不含这些，更新时网关不重启，只靠这里跟上；巡检也会调用（出网网卡 MTU 变了能自动跟上）。
-_live_sync() {
+_live_sync() { # _live_sync [落地]
   [ "$MODE" = kernel ] || return 0
-  [ "$(_epm)" = "$WGL_EPMARK" ] && _ep_rule_sync
-  _cur=$(cat "/sys/class/net/$WGL_IFACE/mtu" 2>/dev/null); _want=$(wg_mtu)
+  _lnd_load "${1:-}" || return 0
+  _iface=$(_landing_iface "$LND")
+  [ "$(_epm)" = "$(_landing_epmark "$LND")" ] && _ep_rule_sync "$LND"
+  _cur=$(cat "/sys/class/net/$_iface/mtu" 2>/dev/null); _want=$(wg_mtu)
   [ -n "$_cur" ] && [ "$_cur" != "$_want" ] || return 0
-  ip link set dev "$WGL_IFACE" mtu "$_want" 2>/dev/null && log "网卡 MTU $_cur → $_want"
+  ip link set dev "$_iface" mtu "$_want" 2>/dev/null && log "网卡 MTU $_cur → $_want"
   return 0
 }
 
-write_gw_json() { # write_gw_json <输出文件>
+# 某个落地的一份 JSON 描述（给 write_gw_json 拼 gw.json 用）：名字、网卡、标记、各 tag、WireGuard 参数、网关端口。
+# 用当前已经解析好的 WG_* 变量（调用前先 _lnd_load 该落地）。
+_gw_landing_json() { # _gw_landing_json <名字>
+  LND="$1"
+  if [ -n "$1" ]; then
+    _sp=$(_lst_get "$1" SOCKS_PORT); _dp=$(_lst_get "$1" DNS_PORT)
+    _stag="socks-$1"; _dtag="dns-$1"; _ntag="wg-dns-$1"
+    if [ "$MODE" = kernel ]; then _wtag="wg-out-$1"; else _wtag="wg-$1"; fi
+  else
+    _sp=$(st_get SOCKS_PORT); _dp=$(st_get DNS_PORT)
+    _stag=socks-in; _dtag=dns-in; _ntag=wg-dns
+    if [ "$MODE" = kernel ]; then _wtag=wg-out; else _wtag=wg; fi
+  fi
+  case "$_sp" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_dp" in ''|*[!0-9]*) return 1 ;; esac
   _mtu=$(wg_mtu)
-  # 无网卡模式里，sing-box 自己连落地机：域名用系统 DNS 解析，按服务器有的网络选 IPv4/IPv6
-  "$JQ" -n \
-    --arg mode "$MODE" --arg iface "$WGL_IFACE" --argjson mark "$WGL_MARK" \
+  "$JQ" -nc \
+    --arg name "$1" --arg iface "$(_landing_iface "$1")" --argjson mark "$(_landing_mark "$1")" \
+    --arg wtag "$_wtag" --arg stag "$_stag" --arg dtag "$_dtag" --arg ntag "$_ntag" \
     --arg priv "$WG_PRIV" --arg pub "$WG_PUB" --arg psk "$WG_PSK" \
     --arg host "$WG_EP_HOST" --argjson port "$WG_EP_PORT" \
     --arg addrs "$(_cidr_list "$WG_ADDR")" --arg allowed "$(_cidr_list "$WG_ALLOWED")" \
     --argjson mtu "$_mtu" --argjson ka "$WG_KA" \
     --arg dns "$WG_DNS1" --arg strat "$WG_STRAT" --arg epstrat "$EP_STRAT" \
-    --argjson sp "$(st_get SOCKS_PORT)" --argjson dp "$(st_get DNS_PORT)" \
+    --argjson sp "$_sp" --argjson dp "$_dp" \
+    '{name: $name, iface: $iface, mark: $mark, wtag: $wtag, stag: $stag, dtag: $dtag, ntag: $ntag,
+      priv: $priv, pub: $pub, psk: $psk, host: $host, port: $port, addrs: $addrs, allowed: $allowed,
+      mtu: $mtu, ka: $ka, dns: $dns, strat: $strat, epstrat: $epstrat, socks_port: $sp, dns_port: $dp}'
+}
+
+write_gw_json() { # write_gw_json <输出文件>
+  # 先把每个落地解析成一份 JSON 描述，再一次生成整个 gw.json
+  _ld=""
+  _names=$(_landing_names)
+  if [ -z "$_names" ]; then
+    # 老布局（还没迁移、或测试里直接拼的状态）：用已经解析好的 WG_* 变量和全局网关端口，当成一个落地
+    _one=$(_gw_landing_json "") || return 1
+    _ld="[$_one]"
+  else
+    for _n in $_names; do
+      _lnd_load "$_n" || return 1
+      _one=$(_gw_landing_json "$_n") || return 1
+      _ld="$_ld${_ld:+,}$_one"
+    done
+    _ld="[$_ld]"
+  fi
+  # 一份 gw.json 里每个落地各一套：无网卡模式一个 wireguard endpoint（wg-<名字>），
+  # 内核模式一个 direct 出站（wg-out-<名字>，绑 wg-<名字> 网卡、打该落地的标记）；
+  # 各一个 SOCKS 入站（socks-<名字>）和 DNS 入站（dns-<名字>），路由按入站 tag 分流到对应出口；
+  # DNS 每个落地一个 server（经各自隧道解析），final 指向第一个落地的出口。
+  # 无网卡模式里，sing-box 自己连落地机：域名用系统 DNS 解析，按服务器有的网络选 IPv4/IPv6
+  "$JQ" -n \
+    --arg mode "$MODE" --argjson landings "$_ld" \
     --arg su "$(st_get SOCKS_USER)" --arg spw "$(st_get SOCKS_PASS)" '
     def words: split(" ") | map(select(length > 0));
     {
       log: { level: "warn", timestamp: true },
       dns: {
         servers: (
-          [ ({ type: "udp", tag: "wg-dns", server: $dns }
-             + (if $mode == "kernel" then { bind_interface: $iface, routing_mark: $mark } else { detour: "wg" } end)) ]
+          [ $landings[] | ({ type: "udp", tag: .ntag, server: .dns }
+             + (if $mode == "kernel" then { bind_interface: .iface, routing_mark: .mark } else { detour: .wtag } end)) ]
           + (if $mode == "kernel" then [] else [ { type: "local", tag: "local" } ] end)
         ),
-        final: "wg-dns",
-        strategy: $strat
+        rules: [ $landings[] | { inbound: [.dtag], server: .ntag } ],
+        final: $landings[0].ntag,
+        strategy: $landings[0].strat
       },
-      inbounds: [
-        { type: "socks", tag: "socks-in", listen: "127.0.0.1", listen_port: $sp,
-          users: [ { username: $su, password: $spw } ] },
-        { type: "direct", tag: "dns-in", listen: "127.0.0.1", listen_port: $dp }
-      ],
+      inbounds: (
+        [ $landings[] | { type: "socks", tag: .stag, listen: "127.0.0.1", listen_port: .socks_port,
+                          users: [ { username: $su, password: $spw } ] } ]
+        + [ $landings[] | { type: "direct", tag: .dtag, listen: "127.0.0.1", listen_port: .dns_port } ]
+      ),
       route: {
         rules: (
-          [ { inbound: [ "dns-in" ], action: "hijack-dns" } ]
-          # 隧道只支持一种 IP 时，另一种 IP 的目标直接拒绝（客户端会马上改用能用的那种），不会走服务器自己的 IP
-          # no_drop：sing-box 默认 30 秒里拒绝超过 50 次就改成“悄悄丢掉”，连接要等超时才失败，
-          # 爱用 IPv6 的设备（比如连着有 IPv6 的 Wi-Fi 的 iPad）就会卡得特别慢；加上它就一直马上拒绝
-          + (if $strat == "ipv4_only" then [ { ip_cidr: [ "::/0" ], action: "reject", no_drop: true } ]
-             elif $strat == "ipv6_only" then [ { ip_cidr: [ "0.0.0.0/0" ], action: "reject", no_drop: true } ]
-             else [] end)
+          [ $landings[] |
+            [ { inbound: [.dtag], action: "hijack-dns" } ]
+            # 隧道只支持一种 IP 时，另一种 IP 的目标直接拒绝（客户端会马上改用能用的那种），不会走服务器自己的 IP
+            # no_drop：sing-box 默认 30 秒里拒绝超过 50 次就改成“悄悄丢掉”，连接要等超时才失败，
+            # 爱用 IPv6 的设备（比如连着有 IPv6 的 Wi-Fi 的 iPad）就会卡得特别慢；加上它就一直马上拒绝
+            + (if .strat == "ipv4_only" then [ { inbound: [.stag], ip_cidr: ["::/0"], action: "reject", no_drop: true } ]
+               elif .strat == "ipv6_only" then [ { inbound: [.stag], ip_cidr: ["0.0.0.0/0"], action: "reject", no_drop: true } ]
+               else [] end)
+            + [ { inbound: [.stag], outbound: .wtag } ]
+          ] | add
         ),
-        final: (if $mode == "kernel" then "wg-out" else "wg" end),
-        default_domain_resolver: { server: "wg-dns", strategy: $strat }
+        final: $landings[0].wtag,
+        default_domain_resolver: { server: $landings[0].ntag, strategy: $landings[0].strat }
       }
     }
     + (if $mode == "kernel" then
-        { outbounds: [ { type: "direct", tag: "wg-out", bind_interface: $iface, routing_mark: $mark } ] }
+        { outbounds: [ $landings[] | { type: "direct", tag: .wtag, bind_interface: .iface, routing_mark: .mark } ] }
       else
-        { endpoints: [ {
-            type: "wireguard", tag: "wg", system: false, mtu: $mtu,
-            address: ($addrs | words), private_key: $priv,
-            peers: [ ({ address: $host, port: $port, public_key: $pub,
-                        allowed_ips: ($allowed | words), persistent_keepalive_interval: $ka }
-                      + (if $psk != "" then { pre_shared_key: $psk } else {} end)) ],
-            domain_resolver: { server: "local", strategy: $epstrat }
+        { endpoints: [ $landings[] | {
+            type: "wireguard", tag: .wtag, system: false, mtu: .mtu,
+            address: (.addrs | words), private_key: .priv,
+            peers: [ ({ address: .host, port: .port, public_key: .pub,
+                        allowed_ips: (.allowed | words), persistent_keepalive_interval: .ka }
+                      + (if .psk != "" then { pre_shared_key: .psk } else {} end)) ],
+            domain_resolver: { server: "local", strategy: .epstrat }
           } ] }
       end)' > "$1" || return 1
   chmod 600 "$1"
 }
 
-# 从保存的状态和配置文件重新读出所有变量（管理命令用）
+# 从保存的状态和配置文件重新读出所有变量（管理命令用）。
+# 第一个落地是默认落地：现有函数（状态、测速、选路）继续用它的变量（EP_FAM、WG_*）；
+# PORTS 是所有落地端口的并集（节点改写、双栈检查按它来，落地归属另外用 _port_landing 查）。
 load_all() {
+  migrate_legacy
   installed || die "还没有安装。请先运行安装脚本。"
-  parse_conf "$CONF" || die "保存的 WireGuard 配置坏了：$PARSE_ERR 请用 wg-luodi set-conf 换一份。"
-  MODE=$(st_get MODE); PORTS=$(st_get PORTS); EP_FAM=$(st_get EP_FAM)
-  [ "$EP_FAM" = 6 ] && EP_STRAT=ipv6_only || EP_STRAT=ipv4_only
+  load_landings
+  MODE=$(st_get MODE)
+  PORTS=$(_all_ports)
+  if [ -n "$LANDINGS" ]; then
+    LND=${LANDINGS%% *}
+    _lnd_load "$LND" || die "保存的 WireGuard 配置坏了：$PARSE_ERR 请用 wg-luodi set-conf 换一份。"
+  else
+    # 还没迁移的老布局（比如 state 不全、没法迁）：按以前的样子读
+    LND=""
+    PORTS=$(st_get PORTS)
+    parse_conf "$CONF" || die "保存的 WireGuard 配置坏了：$PARSE_ERR 请用 wg-luodi set-conf 换一份。"
+    EP_FAM=$(st_get EP_FAM)
+    [ "$EP_FAM" = 6 ] && EP_STRAT=ipv6_only || EP_STRAT=ipv4_only
+  fi
 }
 
 # ---------- 16. 内核网卡模式：建网卡、加专用路由 ----------
 # 关键点：Table = off 的效果——不往主路由表加任何东西，服务器默认路由和 SSH 完全不动。
 # 只加一条规则：“带标记 51888 的包查 51888 号路由表”，那张表里只有一条“全部走 wg-luodi 网卡”。
 # 只有网关程序发出的包带这个标记。
-_wg_setconf_file() { # _wg_setconf_file <标记|off>：生成 wg 命令认识的精简配置（去掉 Address、DNS 等 wg-quick 才认识的项）
+_wg_setconf_file() { # _wg_setconf_file <落地> <标记|off>：先读该落地的配置，再生成 wg 命令认识的精简配置（去掉 Address、DNS 等 wg-quick 才认识的项）
+  _lnd_load "$1" || return 1
   _epip="$WG_EP_HOST"
   if [ "$WG_EP_KIND" = name ]; then
     _r=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}"); [ -n "$_r" ] && _epip="$_r"
@@ -1192,41 +1488,47 @@ _wg_setconf_file() { # _wg_setconf_file <标记|off>：生成 wg 命令认识的
   case "$_epip" in *:*) _epfmt="[$_epip]:$WG_EP_PORT" ;; *) _epfmt="$_epip:$WG_EP_PORT" ;; esac
   printf '[Interface]\nPrivateKey = %s\n' "$WG_PRIV"
   # 不打标记时也要明写 off：setconf 不写这一项就保留网卡上原来的标记（试路时上一个候选的）
-  printf 'FwMark = %s\n' "${1:-off}"
+  printf 'FwMark = %s\n' "${2:-off}"
   printf '\n[Peer]\nPublicKey = %s\n' "$WG_PUB"
   [ -n "$WG_PSK" ] && printf 'PresharedKey = %s\n' "$WG_PSK"
   printf 'AllowedIPs = %s\nEndpoint = %s\nPersistentKeepalive = %s\n' "$WG_ALLOWED" "$_epfmt" "$WG_KA"
 }
 
-# IPv4 和 IPv6 各一份：隧道支持这种 IP，专用表里就是“全部走 wg-luodi 网卡”；
+# IPv4 和 IPv6 各一份：隧道支持这种 IP，专用表里就是“全部走该落地的网卡”；
 # 隧道不支持（比如落地只给了 IPv4），专用表里就是“此路不通”（unreachable），
 # 让带标记的包马上失败，绝不会从服务器自己的 IP 偷偷出去。没带标记的包（SSH、节点回给客户端的包）完全不受影响。
-_rules_add() {
+_rules_add() { # _rules_add [落地]
+  _lnd_load "${1:-}" || return 1
+  _iface=$(_landing_iface "$LND"); _mark=$(_landing_mark "$LND")
+  _table=$(_landing_table "$LND"); _pref=$(_landing_pref "$LND")
   for _f in 4 6; do
     if [ "$_f" = 4 ]; then _on="$WG_HAS4"; else _on="$WG_HAS6"; fi
     if [ "$_on" = 1 ]; then
-      ip -$_f route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
+      ip -$_f route replace default dev "$_iface" table "$_table" 2>/dev/null
     else
-      ip -$_f route replace unreachable default table "$WGL_TABLE" 2>/dev/null
+      ip -$_f route replace unreachable default table "$_table" 2>/dev/null
     fi
-    while ip -$_f rule del fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null; do :; done
-    ip -$_f rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
+    while ip -$_f rule del fwmark "$_mark" lookup "$_table" pref "$_pref" 2>/dev/null; do :; done
+    ip -$_f rule add fwmark "$_mark" lookup "$_table" pref "$_pref" 2>/dev/null
   done
   return 0
 }
 
 # 不打断流量地把专用路由补齐：路由用 replace（原地替换），规则只在缺的时候才加。
 # 更新时网关不重启，就用它代替“删了重建”。
-_rules_sync() {
+_rules_sync() { # _rules_sync [落地]
+  _lnd_load "${1:-}" || return 1
+  _iface=$(_landing_iface "$LND"); _mark=$(_landing_mark "$LND")
+  _table=$(_landing_table "$LND"); _pref=$(_landing_pref "$LND")
   for _f in 4 6; do
     if [ "$_f" = 4 ]; then _on="$WG_HAS4"; else _on="$WG_HAS6"; fi
     if [ "$_on" = 1 ]; then
-      ip -$_f route replace default dev "$WGL_IFACE" table "$WGL_TABLE" 2>/dev/null
+      ip -$_f route replace default dev "$_iface" table "$_table" 2>/dev/null
     else
-      ip -$_f route replace unreachable default table "$WGL_TABLE" 2>/dev/null
+      ip -$_f route replace unreachable default table "$_table" 2>/dev/null
     fi
-    ip -$_f rule show 2>/dev/null | grep -q "lookup $WGL_TABLE" \
-      || ip -$_f rule add fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null
+    ip -$_f rule show 2>/dev/null | grep -q "lookup $_table" \
+      || ip -$_f rule add fwmark "$_mark" lookup "$_table" pref "$_pref" 2>/dev/null
   done
   return 0
 }
@@ -1234,65 +1536,71 @@ _rules_sync() {
 # WireGuard 自己连落地机的包（加密后的 UDP）打一个标记，让它从服务器自己的网卡直接出去。
 # 服务器上要是装了 L2TP / WARP 之类“全局出口”（策略路由把所有流量拉走，有的还用防火墙封住直连），
 # WireGuard 的包会被拉进它们，MTU 变小、多绕一层。所以建网卡时先试：
-#   ① 本脚本的标记 51889 + 一条“带它的查主路由表”的规则（优先级 5189，排在它们前面）；
-#      服务器装了 L2TP-VPS 时改用它专门留给别的程序直连的标记 0x24682（它的防火墙只放行这个，51889 一定被拦）；
+#   ① 该落地自己的标记（第一个落地是 51889，往后每个落地加 1）+ 一条“带它的查主路由表”的规则
+#      （优先级 5189，排在它们前面）；
+#      服务器装了 L2TP-VPS 时改用它专门留给别的程序直连的标记 0x24682（它的防火墙只放行这个，本脚本的标记一定被拦）；
 #   ② 都不行：不打标记，走服务器默认的路（和以前一样），MTU 按那条路自动调小。
 # 一条路“能用”要同时满足：能握手，而且大包也能过（见 _mtu_probe）。只看握手不够：握手包只有 148 字节，
 # 以前就出现过借用 L2TP 的直连标记握手成功、延迟正常、网页却打不开的情况。
 # 选好的记在状态里（EP_MARK），以后直接用；别的程序的规则和防火墙一条都不动。
 # EP_MARK：空 = 还没选；数字 = 用这个标记；off = 直连都不通，走默认的路；
 #          retry = 试的时候落地机怎么都握不上手（多半是落地机暂时不在线），先走默认的路，巡检时再试。
-_epm() { # 现在用的标记：数字或 off（试的时候用 EPM_TRY）
-  _x=${EPM_TRY:-$(st_get EP_MARK)}
+_epm() { # 现在用的标记：数字或 off（试的时候用 EPM_TRY；看的是当前落地 LND）
+  _x=${EPM_TRY:-$(_lget "$LND" EP_MARK)}
   [ "$MODE" = kernel ] || _x=off
-  case "$_x" in '') _x=$WGL_EPMARK ;; *[!0-9]*) _x=off ;; esac
+  case "$_x" in '') _x=$(_landing_epmark "$LND") ;; *[!0-9]*) _x=off ;; esac
   printf '%s' "$_x"
 }
 _epm_arg() { _x=$(_epm); [ "$_x" != off ] && printf 'mark %s' "$_x"; }
-_ep_rule_sync() {
+_ep_rule_sync() { # _ep_rule_sync [落地]：补上“带该落地标记的包查主路由表”的规则（几个落地共用优先级 5189，各查各的标记）
   _has ip || return 0
+  _em=$(_landing_epmark "${1:-}")
+  _hex=$(printf '%x' "$_em")
   for _f in 4 6; do
-    ip -$_f rule show 2>/dev/null | grep -q "^$WGL_EPPREF:" \
-      || ip -$_f rule add fwmark "$WGL_EPMARK" lookup main pref "$WGL_EPPREF" 2>/dev/null
+    ip -$_f rule show 2>/dev/null | grep -q "fwmark 0x$_hex lookup main" \
+      || ip -$_f rule add fwmark "$_em" lookup main pref "$WGL_EPPREF" 2>/dev/null
   done
   return 0
 }
-_ep_rule_del() {
+_ep_rule_del() { # _ep_rule_del [落地]
+  _em=$(_landing_epmark "${1:-}")
   for _f in 4 6; do
-    while ip -$_f rule del fwmark "$WGL_EPMARK" lookup main pref "$WGL_EPPREF" 2>/dev/null; do :; done
+    while ip -$_f rule del fwmark "$_em" lookup main pref "$WGL_EPPREF" 2>/dev/null; do :; done
   done
   return 0
 }
 # 要试的标记。装了 L2TP-VPS 的服务器只试它的直连标记 0x24682（十进制 149122）：
-# 它的路由规则 8906 一直都在、防火墙放行带这个标记的包；本脚本的 51889 会被它的断线保护拦下，白等 8 秒。
+# 它的路由规则 8906 一直都在、防火墙放行带这个标记的包；本脚本的标记会被它的断线保护拦下，白等 8 秒。
 _ep_cands() {
   if [ -f "$WGL_L2TP_DIR/v2-owned" ] && ip -"${EP_FAM:-4}" rule show pref 8906 2>/dev/null | grep -q 'fwmark 0x24682 lookup main'; then
     echo 149122
   else
-    echo "$WGL_EPMARK"
+    echo "$(_landing_epmark "$LND")"
   fi
 }
-# 经隧道 ping（带专用标记，走 wg-luodi 网卡；-M do 禁止分片），包大小 = $1 字节的数据。
+# 经隧道 ping（带该落地的专用标记，走它的网卡；-M do 禁止分片），包大小 = $1 字节的数据。
 # 隧道有 IPv4 就 ping 1.1.1.1，只有 IPv6 就 ping 2606:4700:4700::1111（_mtu_probe 里选好 _pt/_pf）。
-_ping_tun() { ping $_pf -c 3 -i 0.2 -W 1 -m "$WGL_MARK" -M "do" -s "$1" "$_pt" >/dev/null 2>&1; }
+_ping_tun() { ping $_pf -c 3 -i 0.2 -W 1 -m "$(_landing_mark "$LND")" -M "do" -s "$1" "$_pt" >/dev/null 2>&1; }
 # 这条路大包能不能过。从按网卡算出的 MTU 往下试，找出真能过的最大 MTU，记在 EP_MTU（“标记:MTU”）。
 # 返回 0：找到了；1：小包能过、大包都过不去（这条路传不了网页）；
 #      2：判断不了（没有支持 -M/-m 的 ping，比如 Alpine 的 busybox；落地不回 ping）。
 # IP 包头：IPv4 + ICMP 是 28 字节，IPv6 + ICMPv6 是 48 字节，MTU = 数据大小 + 包头。
-_mtu_probe() {
-  _has ping || { _tcp_probe; return $?; }
+_mtu_probe() { # _mtu_probe [落地]
+  _lnd_load "${1:-}" || return 2
+  _iface=$(_landing_iface "$LND")
+  _has ping || { _tcp_probe "$LND"; return $?; }
   if [ "$WG_HAS4" = 1 ]; then _pt=1.1.1.1; _pf=""; _ph=28
   elif [ "$WG_HAS6" = 1 ]; then _pt=2606:4700:4700::1111; _pf=-6; _ph=48
   else return 2; fi
-  ping -c 1 -W 1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1 || { _tcp_probe; return $?; }
+  ping -c 1 -W 1 -M "do" -s 16 127.0.0.1 >/dev/null 2>&1 || { _tcp_probe "$LND"; return $?; }
   _pm=$(_epm); _top=$(wg_mtu)
-  ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
+  ip link set dev "$_iface" mtu "$_top" 2>/dev/null
   # 很多落地机不回 ping：这时改用真的下载来判断，免得能直连也被当成“判断不了”、被迫套在别的隧道里走（慢）
-  _ping_tun 56 || { _tcp_probe; return $?; }
+  _ping_tun 56 || { _tcp_probe "$LND"; return $?; }
   for _s in "$_top" 1400 1380 1340 1300 1280; do
     [ "$_s" -le "$_top" ] || continue
     if _ping_tun $((_s - _ph)); then
-      st_set EP_MTU "$_pm:$_s"
+      _lset "$LND" EP_MTU "$_pm:$_s"
       [ "$_s" = "$_top" ] || log "这条路大包只能过 $_s，隧道 MTU 调成 $_s"
       return 0
     fi
@@ -1300,150 +1608,167 @@ _mtu_probe() {
   return 1
 }
 # 把 WireGuard 配置（带标记）装进网卡。setconf 会把对端重建一遍，马上重新握手，正好用来试一条路。
-_wg_load() { # _wg_load <标记|off>
+_wg_load() { # _wg_load <落地> <标记|off>
   mkdir -p "$WGL_WGDIR" && chmod 700 "$WGL_WGDIR"
-  _sc="$WGL_WGDIR/$WGL_IFACE-setconf.conf"
-  _wg_setconf_file "$1" > "$_sc"; chmod 600 "$_sc"
-  wg setconf "$WGL_IFACE" "$_sc"; _rc=$?
+  _sc="$WGL_WGDIR/$(_landing_iface "$1")-setconf.conf"
+  _wg_setconf_file "$1" "$2" > "$_sc"; chmod 600 "$_sc"
+  wg setconf "$(_landing_iface "$1")" "$_sc"; _rc=$?
   rm -f "$_sc"
   return $_rc
 }
-_hs_wait() { # _hs_wait <秒>：这么多秒内和落地机握上手返回 0
+_hs_wait() { # _hs_wait <落地> <秒>：这么多秒内和落地机握上手返回 0
   _i=0
-  while [ "$_i" -lt "$1" ]; do
-    _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  while [ "$_i" -lt "$2" ]; do
+    _hs=$(wg show "$(_landing_iface "$1")" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     [ -n "$_hs" ] && [ "$_hs" != 0 ] && return 0
     _i=$((_i + 1)); sleep 1
   done
   return 1
 }
-_ep_pick() {
-  st_set EP_MTU ""
+_ep_pick() { # _ep_pick [落地]
+  _lnd_load "${1:-}" || return 1
+  _own_epmark=$(_landing_epmark "$LND")
+  _lset "$LND" EP_MTU ""
   for EPM_TRY in $(_ep_cands); do
-    [ "$EPM_TRY" = "$WGL_EPMARK" ] && _ep_rule_sync
-    _wg_load "$EPM_TRY" >/dev/null 2>&1 || continue
-    _hs_wait 8 || continue
-    _mtu_probe; _pr=$?
+    [ "$EPM_TRY" = "$_own_epmark" ] && _ep_rule_sync "$LND"
+    _wg_load "$LND" "$EPM_TRY" >/dev/null 2>&1 || continue
+    _hs_wait "$LND" 8 || continue
+    _mtu_probe "$LND"; _pr=$?
     # 本脚本自己的标记：判断不了大包时照旧用（和以前一样）；借用 L2TP 的直连标记：必须确认大包能过才用。
-    if [ "$_pr" = 0 ] || { [ "$_pr" = 2 ] && [ "$EPM_TRY" = "$WGL_EPMARK" ]; }; then
-      [ "$EPM_TRY" = "$WGL_EPMARK" ] || _ep_rule_del
-      st_set EP_MARK "$EPM_TRY"; st_set EP_CHECK 3; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
+    if [ "$_pr" = 0 ] || { [ "$_pr" = 2 ] && [ "$EPM_TRY" = "$_own_epmark" ]; }; then
+      [ "$EPM_TRY" = "$_own_epmark" ] || _ep_rule_del "$LND"
+      _lset "$LND" EP_MARK "$EPM_TRY"; _lset "$LND" EP_CHECK 3; log "连落地机用标记 $EPM_TRY（走 $(_ep_dev_show)）"
       EPM_TRY=""; return 0
     fi
-    st_set EP_MTU ""
+    _lset "$LND" EP_MTU ""
     if [ "$_pr" = 1 ]; then log "标记 $EPM_TRY 能握手，但大包过不去，不用这条路"
     else log "标记 $EPM_TRY 能握手，但没法确认大包能过（落地不回 ping），不用这条路"; fi
   done
-  _ep_rule_del
-  EPM_TRY=off; _wg_load off
-  if _hs_wait 8; then
-    _mtu_probe
-    st_set EP_MARK off; log "直连不可用，连落地机走服务器默认的路（$(_ep_dev_show)）"
+  _ep_rule_del "$LND"
+  EPM_TRY=off; _wg_load "$LND" off
+  if _hs_wait "$LND" 8; then
+    _mtu_probe "$LND"
+    _lset "$LND" EP_MARK off; log "直连不可用，连落地机走服务器默认的路（$(_ep_dev_show)）"
   else
-    st_set EP_MARK retry; log "落地机怎么都握不上手（可能暂时不在线），先走默认的路，巡检时再试"
+    _lset "$LND" EP_MARK retry; log "落地机怎么都握不上手（可能暂时不在线），先走默认的路，巡检时再试"
   fi
-  st_set EP_CHECK 3
+  _lset "$LND" EP_CHECK 3
   EPM_TRY=""
   return 0
 }
 
-# 不靠 ping 的办法：curl 绑在 wg-luodi 网卡上经隧道下载。TCP 会按网卡 MTU 把包塞满，
+# 不靠 ping 的办法：curl 绑在该落地的网卡上经隧道下载。TCP 会按网卡 MTU 把包塞满，
 # 能完整下载 2MB 就说明这么大的包过得去。先用 MTU 1280 访问一个很小的网页，确认隧道本身能上网，
 # 再从当前 MTU 往下试 1340、1280。返回值和 _mtu_probe 一样（0 找到 / 1 大包过不去 / 2 判断不了）。
-_curl_tun() { _to 25 curl -4 -fsS -o /dev/null --interface "$WGL_IFACE" --connect-timeout 8 --max-time 20 "$1" 2>/dev/null; }
-_tcp_probe() {
+_curl_tun() { _to 25 curl -4 -fsS -o /dev/null --interface "$(_landing_iface "$LND")" --connect-timeout 8 --max-time 20 "$1" 2>/dev/null; }
+_tcp_probe() { # _tcp_probe [落地]
+  _lnd_load "${1:-}" || return 2
   [ "$WG_HAS4" = 1 ] && _has curl || return 2
   _pm=$(_epm); _top=$(wg_mtu)
-  ip link set dev "$WGL_IFACE" mtu 1280 2>/dev/null
-  if ! _curl_tun "$WGL_TRACE_URL"; then ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null; return 2; fi
+  _iface=$(_landing_iface "$LND")
+  ip link set dev "$_iface" mtu 1280 2>/dev/null
+  if ! _curl_tun "$WGL_TRACE_URL"; then ip link set dev "$_iface" mtu "$_top" 2>/dev/null; return 2; fi
   for _s in "$_top" 1340 1280; do
     [ "$_s" -le "$_top" ] || continue
-    ip link set dev "$WGL_IFACE" mtu "$_s" 2>/dev/null
+    ip link set dev "$_iface" mtu "$_s" 2>/dev/null
     if _curl_tun "$WGL_PROBE_URL"; then
-      st_set EP_MTU "$_pm:$_s"
+      _lset "$LND" EP_MTU "$_pm:$_s"
       [ "$_s" = "$_top" ] || log "这条路大包只能过 $_s（下载实测），隧道 MTU 调成 $_s"
       return 0
     fi
   done
-  ip link set dev "$WGL_IFACE" mtu "$_top" 2>/dev/null
+  ip link set dev "$_iface" mtu "$_top" 2>/dev/null
   return 1
 }
 
-kernel_up() {
+kernel_up() { # kernel_up [落地]：不给名字就对所有落地各建一张网卡（没有落地时按老布局建 wg-luodi）
+  if [ $# -eq 0 ] && [ -n "$(_landing_names)" ]; then
+    for _n in $(_landing_names); do kernel_up "$_n" || return 1; done
+    return 0
+  fi
+  _lnd_load "${1:-}" || return 1
+  _iface=$(_landing_iface "$LND")
   _has modprobe && modprobe wireguard >/dev/null 2>&1
-  ip link del dev "$WGL_IFACE" >/dev/null 2>&1
-  ip link add dev "$WGL_IFACE" type wireguard || { err "建不了 WireGuard 网卡"; return 1; }
-  # 回来的包从 wg-luodi 进来，严格的“反向路径检查”会把它当成假包丢掉，这张网卡单独改成宽松模式
-  echo 2 > "/proc/sys/net/ipv4/conf/$WGL_IFACE/rp_filter" 2>/dev/null
+  ip link del dev "$_iface" >/dev/null 2>&1
+  ip link add dev "$_iface" type wireguard || { err "建不了 WireGuard 网卡"; return 1; }
+  # 回来的包从这张网卡进来，严格的“反向路径检查”会把它当成假包丢掉，这张网卡单独改成宽松模式
+  echo 2 > "/proc/sys/net/ipv4/conf/$_iface/rp_filter" 2>/dev/null
   # Ubuntu 新版自带 wg 的 AppArmor 规则：wg 只能读 /etc/wireguard/ 里的文件，
   # 放别处会报 “fopen: Permission denied”，所以临时配置写到这个目录里（_wg_load 里）
-  if [ "$(_epm)" = "$WGL_EPMARK" ]; then _ep_rule_sync; else _ep_rule_del; fi
-  if ! _wg_load "$(_epm)"; then
-    ip link del dev "$WGL_IFACE" >/dev/null 2>&1; err "WireGuard 配置装不进网卡"; return 1
+  if [ "$(_epm)" = "$(_landing_epmark "$LND")" ]; then _ep_rule_sync "$LND"; else _ep_rule_del "$LND"; fi
+  if ! _wg_load "$LND" "$(_epm)"; then
+    ip link del dev "$_iface" >/dev/null 2>&1; err "WireGuard 配置装不进网卡"; return 1
   fi
-  for _a in $WG_ADDR4; do ip -4 addr add "$_a" dev "$WGL_IFACE" || { ip link del dev "$WGL_IFACE"; return 1; }; done
-  for _a in $WG_ADDR6; do ip -6 addr add "$_a" dev "$WGL_IFACE" 2>/dev/null; done
-  ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" up || { ip link del dev "$WGL_IFACE"; return 1; }
-  _rules_add
+  for _a in $WG_ADDR4; do ip -4 addr add "$_a" dev "$_iface" || { ip link del dev "$_iface"; return 1; }; done
+  for _a in $WG_ADDR6; do ip -6 addr add "$_a" dev "$_iface" 2>/dev/null; done
+  ip link set dev "$_iface" mtu "$(wg_mtu)" up || { ip link del dev "$_iface"; return 1; }
+  _rules_add "$LND"
   # 还没选过连落地机的路：现在试（第一次装、更新、换配置、换模式后）
   # 选路时留一个标记文件（里面是进程号）：状态页能显示“正在选路”，巡检也不会把正在启动的网关当成挂了去重启。
-  case "$(st_get EP_MARK)" in ''|retry)
+  case "$(_lget "$LND" EP_MARK)" in ''|retry)
     echo $$ > "$WGL_DIR/picking"
-    _ep_pick; ip link set dev "$WGL_IFACE" mtu "$(wg_mtu)" 2>/dev/null
+    _ep_pick "$LND"; ip link set dev "$_iface" mtu "$(wg_mtu)" 2>/dev/null
     rm -f "$WGL_DIR/picking" ;;
   esac
-  log "内核网卡 $WGL_IFACE 已建好"
+  log "内核网卡 $_iface 已建好"
 }
 
-kernel_down() {
+kernel_down() { # kernel_down [落地]：不给名字就拆掉所有落地的网卡（没有落地时按老布局拆 wg-luodi）
+  if [ $# -eq 0 ] && [ -n "$(_landing_names)" ]; then
+    for _n in $(_landing_names); do kernel_down "$_n"; done
+    return 0
+  fi
+  _mark=$(_landing_mark "${1:-}"); _table=$(_landing_table "${1:-}"); _pref=$(_landing_pref "${1:-}")
   for _f in 4 6; do
-    while ip -$_f rule del fwmark "$WGL_MARK" lookup "$WGL_TABLE" pref "$WGL_PREF" 2>/dev/null; do :; done
-    ip -$_f route flush table "$WGL_TABLE" 2>/dev/null
+    while ip -$_f rule del fwmark "$_mark" lookup "$_table" pref "$_pref" 2>/dev/null; do :; done
+    ip -$_f route flush table "$_table" 2>/dev/null
   done
-  _ep_rule_del
-  ip link del dev "$WGL_IFACE" 2>/dev/null
+  _ep_rule_del "${1:-}"
+  ip link del dev "$(_landing_iface "${1:-}")" 2>/dev/null
   return 0
 }
 
 # 巡检用：网卡在、规则在就什么都不做；规则被别的程序清掉了就补上；网卡没了返回 1（让服务重启）
-kernel_ensure() {
-  ip link show dev "$WGL_IFACE" >/dev/null 2>&1 || return 1
-  if ! ip -4 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "专用路由规则丢了，已补回"; fi
-  if ! ip -4 route show table "$WGL_TABLE" 2>/dev/null | grep -q default; then _rules_add; log "专用路由表丢了，已补回"; fi
+kernel_ensure() { # kernel_ensure [落地]
+  _lnd_load "${1:-}" || return 1
+  _iface=$(_landing_iface "$LND"); _table=$(_landing_table "$LND")
+  ip link show dev "$_iface" >/dev/null 2>&1 || return 1
+  if ! ip -4 rule show 2>/dev/null | grep -q "lookup $_table"; then _rules_add "$LND"; log "专用路由规则丢了，已补回"; fi
+  if ! ip -4 route show table "$_table" 2>/dev/null | grep -q default; then _rules_add "$LND"; log "专用路由表丢了，已补回"; fi
   # IPv6 那一份（机器有 IPv6 才查；没有 IPv6 的内核会直接报错，不用管）
-  if [ -e /proc/net/if_inet6 ] && ! ip -6 rule show 2>/dev/null | grep -q "lookup $WGL_TABLE"; then _rules_add; log "IPv6 专用路由规则丢了，已补回"; fi
-  _live_sync
+  if [ -e /proc/net/if_inet6 ] && ! ip -6 rule show 2>/dev/null | grep -q "lookup $_table"; then _rules_add "$LND"; log "IPv6 专用路由规则丢了，已补回"; fi
+  _live_sync "$LND"
   # 用着直连标记却很久没握手（比如别的程序改了防火墙）：清掉选择，让网关重启时重新试
-  _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+  _hs=$(wg show "$_iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
   # 选路办法升级后重新选一次（网关重启，隧道会短暂重连一次）：
   #   1.1.13 及以前只看握手、没试过大包（EP_CHECK 不是 2/3）；
   #   1.1.16 及以前只会用 ping 试大包，落地不回 ping 时被迫套在别的隧道里走（off 且 EP_CHECK 不是 3）。
-  _ck=$(st_get EP_CHECK)
-  case "$(st_get EP_MARK)" in
+  _ck=$(_lget "$LND" EP_CHECK)
+  case "$(_lget "$LND" EP_MARK)" in
     ''|retry) ;;
-    off) if [ "$_ck" != 3 ]; then st_set EP_MARK ""; log "按新办法（ping 不通就实际下载试）重新选一次连落地机的路"; return 1; fi ;;
-    *) if [ "$_ck" != 2 ] && [ "$_ck" != 3 ]; then st_set EP_MARK ""; log "按新办法（握手 + 大包都要通）重新选一次连落地机的路"; return 1; fi ;;
+    off) if [ "$_ck" != 3 ]; then _lset "$LND" EP_MARK ""; log "按新办法（ping 不通就实际下载试）重新选一次连落地机的路"; return 1; fi ;;
+    *) if [ "$_ck" != 2 ] && [ "$_ck" != 3 ]; then _lset "$LND" EP_MARK ""; log "按新办法（握手 + 大包都要通）重新选一次连落地机的路"; return 1; fi ;;
   esac
   # 上次没选成（retry）也在这里重试：这时隧道本来就不通，重启网关不影响什么
-  case "$(st_get EP_MARK)" in off) ;; *)
+  case "$(_lget "$LND" EP_MARK)" in off) ;; *)
     if [ -n "$_hs" ] && { [ "$_hs" = 0 ] || [ $(($(date +%s) - _hs)) -gt 300 ]; }; then
-      st_set EP_MARK ""; log "连落地机很久没握手，重新选路"; return 1
+      _lset "$LND" EP_MARK ""; log "连落地机很久没握手，重新选路"; return 1
     fi ;;
   esac
   # retry 时走的是默认的路（装了 L2TP 就是套在 L2TP 里），大包也没试过。落地机回来后在这条路上又握上了手，
   # 上面“很久没握手”就不成立了，以前会一直停在这条路上：现在握上手就重新选一次（网关重启一次）。
-  if [ "$(st_get EP_MARK)" = retry ] && [ -n "$_hs" ] && [ "$_hs" != 0 ]; then
-    st_set EP_MARK ""; log "落地机又能握手了，重新选一次连落地机的路"; return 1
+  if [ "$(_lget "$LND" EP_MARK)" = retry ] && [ -n "$_hs" ] && [ "$_hs" != 0 ]; then
+    _lset "$LND" EP_MARK ""; log "落地机又能握手了，重新选一次连落地机的路"; return 1
   fi
   # 落地机是域名、而且很久没握手：重新解析一次（落地机换了 IP 时自动跟上）
   if [ "$WG_EP_KIND" = name ] && _has wg; then
-    _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    _hs=$(wg show "$_iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
     _now=$(date +%s)
     if [ -z "$_hs" ] || [ "$_hs" = 0 ] || [ $((_now - _hs)) -gt 300 ]; then
       _r=$(_resolve "$WG_EP_HOST" "${EP_FAM:-4}")
       if [ -n "$_r" ]; then
         case "$_r" in *:*) _r="[$_r]" ;; esac
-        wg set "$WGL_IFACE" peer "$WG_PUB" endpoint "$_r:$WG_EP_PORT" 2>/dev/null
+        wg set "$_iface" peer "$WG_PUB" endpoint "$_r:$WG_EP_PORT" 2>/dev/null
       fi
     fi
   fi
@@ -1451,97 +1776,125 @@ kernel_ensure() {
 }
 
 # ---------- 17. 改节点配置（核心） ----------
-# 做法：给“监听在 WireGuard 端口上的入站”加一个标签，再加一条路由规则“这些入站 → 出站 wg-luodi”，
-# 出站 wg-luodi 就是本机网关（127.0.0.1 上的 SOCKS5）。其它入站一个字都不动。
+# 做法：给“监听在 WireGuard 端口上的入站”加一个标签，再加路由规则“这些入站 → 对应落地的出站”，
+# 每个落地一个出站（tag wg-luodi-<落地>，就是本机网关上那个落地的 SOCKS5 入站）。其它入站一个字都不动。
 # 每次都是“先删掉我们以前加的，再按现在的端口重新加”，所以重复运行结果一样，删端口也是同一套逻辑。
-# 我们加的东西都带 wg-luodi 字样，卸载时只删这些。
+# 我们加的东西都带 wg-luodi 字样，卸载时只删这些。删的时候连老版的单出站（tag wg-luodi）一起删，
+# 所以老版装过的节点第一次重新应用时，出站会自动换成带落地名字的新 tag（节点会重启一次）。
 JQ_COMMON='
-def wgp: $ports | map(tostring);
-def inlist($p): (wgp | map(select(. == $p)) | length) > 0;
+def inlist($p): ($pmap | has($p));
 def ours: ((. // "") | tostring | startswith("wg-luodi-in-"));
+def ours_out: ((. // "") | tostring | test("^wg-luodi(-|$)"));
+def otag($l): if $l == "" then "wg-luodi" else "wg-luodi-" + $l end;
 '
 JQ_XRAY="$JQ_COMMON"'
 def hit: ((.port // "") | tostring) as $p | inlist($p);
 def strip:
   (if (.inbounds | type) == "array" then .inbounds |= map(if (.tag | ours) then del(.tag) else . end) else . end)
-  | (if (.outbounds | type) == "array" then .outbounds |= map(select((.tag // "") != "wg-luodi")) else . end)
-  | (if (.routing.rules | type) == "array" then .routing.rules |= map(select((.outboundTag // "") != "wg-luodi")) else . end)
+  | (if (.outbounds | type) == "array" then .outbounds |= map(select((.tag | ours_out) | not)) else . end)
+  | (if (.routing.rules | type) == "array" then .routing.rules |= map(select((.outboundTag | ours_out) | not)) else . end)
   | (if .routing == {"rules": []} then del(.routing) else . end);
 strip
 | if ([.inbounds[]? | select(hit)] | length) == 0 then .
   else
     .inbounds |= map(if hit then .tag = (.tag // ("wg-luodi-in-" + (.port | tostring))) else . end)
-    | ([.inbounds[] | select(hit) | .tag]) as $tags
-    | .outbounds = ((.outbounds // []) | if length == 0 then [{protocol: "freedom", tag: "direct"}] else . end) + [$ob]
-    | .routing = ((.routing // {}) | .rules = ([{type: "field", inboundTag: $tags, outboundTag: "wg-luodi"}] + (.rules // [])))
+    | ([.inbounds[] | select(hit) | {tag, l: ($pmap[(.port | tostring)] // "")}] | sort_by(.l) | group_by(.l)
+       | map({type: "field", inboundTag: map(.tag), outboundTag: otag(.[0].l)})) as $rules
+    | .outbounds = ((.outbounds // []) | if length == 0 then [{protocol: "freedom", tag: "direct"}] else . end) + $obs
+    | .routing = ((.routing // {}) | .rules = ($rules + (.rules // [])))
   end'
 JQ_SB="$JQ_COMMON"'
 def hit: ((.listen_port // "") | tostring) as $p | inlist($p);
 def strip:
   (if (.inbounds | type) == "array" then .inbounds |= map(if (.tag | ours) then del(.tag) else . end) else . end)
-  | (if (.outbounds | type) == "array" then .outbounds |= map(select((.tag // "") != "wg-luodi")) else . end)
-  | (if (.route.rules | type) == "array" then .route.rules |= map(select((.outbound // "") != "wg-luodi")) else . end)
+  | (if (.outbounds | type) == "array" then .outbounds |= map(select((.tag | ours_out) | not)) else . end)
+  | (if (.route.rules | type) == "array" then .route.rules |= map(select((.outbound | ours_out) | not)) else . end)
   | (if .route == {"rules": []} then del(.route) else . end);
 strip
 | if ([.inbounds[]? | select(hit)] | length) == 0 then .
   else
     .inbounds |= map(if hit then .tag = (.tag // ("wg-luodi-in-" + (.listen_port | tostring))) else . end)
-    | ([.inbounds[] | select(hit) | .tag]) as $tags
-    | .outbounds = ((.outbounds // []) | if length == 0 then [{type: "direct", tag: "direct"}] else . end) + [$ob]
+    | ([.inbounds[] | select(hit) | {tag, l: ($pmap[(.listen_port | tostring)] // "")}] | sort_by(.l) | group_by(.l)
+       | map({inbound: map(.tag), outbound: otag(.[0].l)})) as $rules
+    | .outbounds = ((.outbounds // []) | if length == 0 then [{type: "direct", tag: "direct"}] else . end) + $obs
     | .route = ((.route // {}) | .rules = ((.rules // []) as $r
         | ([range(0; $r | length) | select(($r[.].action // "") != "sniff")] | .[0] // ($r | length)) as $i
-        | $r[:$i] + [{inbound: $tags, outbound: "wg-luodi"}] + $r[$i:]))
+        | $r[:$i] + $rules + $r[$i:]))
   end'
 
-# 网关的 SOCKS5 出站，三种程序各写各的格式
-_ob_xray() { # _ob_xray new|old
-  if [ "$1" = new ]; then
-    "$JQ" -nc --argjson sp "$(st_get SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
-      '{tag: "wg-luodi", protocol: "socks", settings: {address: "127.0.0.1", port: $sp, user: $u, pass: $p}}'
+# 网关的 SOCKS5 出站，三种程序各写各的格式（每个落地一个，tag 和 SOCKS 端口按落地来）
+_ob_xray() { # _ob_xray <落地> new|old
+  if [ "$2" = new ]; then
+    "$JQ" -nc --arg tag "$(_ob_tag "$1")" --argjson sp "$(_lget "$1" SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
+      '{tag: $tag, protocol: "socks", settings: {address: "127.0.0.1", port: $sp, user: $u, pass: $p}}'
   else
-    "$JQ" -nc --argjson sp "$(st_get SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
-      '{tag: "wg-luodi", protocol: "socks", settings: {servers: [{address: "127.0.0.1", port: $sp, users: [{user: $u, pass: $p}]}]}}'
+    "$JQ" -nc --arg tag "$(_ob_tag "$1")" --argjson sp "$(_lget "$1" SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
+      '{tag: $tag, protocol: "socks", settings: {servers: [{address: "127.0.0.1", port: $sp, users: [{user: $u, pass: $p}]}]}}'
   fi
 }
-_ob_sb() {
-  "$JQ" -nc --argjson sp "$(st_get SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
-    '{type: "socks", tag: "wg-luodi", server: "127.0.0.1", server_port: $sp, version: "5", username: $u, password: $p}'
+_ob_sb() { # _ob_sb <落地>
+  "$JQ" -nc --arg tag "$(_ob_tag "$1")" --argjson sp "$(_lget "$1" SOCKS_PORT)" --arg u "$(st_get SOCKS_USER)" --arg p "$(st_get SOCKS_PASS)" \
+    '{type: "socks", tag: $tag, server: "127.0.0.1", server_port: $sp, version: "5", username: $u, password: $p}'
 }
 _ports_json() { # "a b" -> [a,b]
   printf '%s\n' $1 | awk 'BEGIN { printf "[" } /^[0-9]+$/ { printf "%s%s", (n++ ? "," : ""), $1 } END { printf "]" }'
 }
+# 映射（“端口:落地”空格分隔）-> {"端口": "落地", ...}（给 jq 的 $pmap 用）
+_map_json() {
+  _mj="{"
+  for _pr in $1; do
+    _pp=${_pr%%:*}; _ll=${_pr#*:}; [ "$_pp" = "$_pr" ] && _ll=""
+    _mj="$_mj\"$_pp\":\"$_ll\","
+  done
+  printf '%s}' "${_mj%,}"
+}
+# 映射里用到的每个落地各一个出站，拼成 JSON 数组（按映射里出现的顺序；老布局一个）
+_obs_json() { # _obs_json <类型> <映射> [xray 出站格式 new|old]
+  _oj="["
+  _seen=" "
+  for _pr in $2; do
+    _ll=${_pr#*:}; [ "${_pr%%:*}" = "$_pr" ] && _ll=""
+    case "$_seen" in *" $_ll "*) continue ;; esac
+    _seen="$_seen$_ll "
+    if [ "$1" = xray ]; then _one=$(_ob_xray "$_ll" "${3:-old}"); else _one=$(_ob_sb "$_ll"); fi
+    _oj="$_oj$_one,"
+  done
+  printf '%s]' "${_oj%,}"
+}
 
 # Hysteria2（YAML）：在文件末尾加一段带标记的 outbounds + resolver；删的时候按标记整段删。
-# Hysteria2 不能按“入站端口”分流，所以这个实例（一个端口）整个走 WireGuard。
+# Hysteria2 不能按“入站端口”分流，所以这个实例（一个端口）整个走它端口所属的落地。
 hy_strip() { awk '/^# wg-luodi begin/ { skip = 1 } !skip { print } /^# wg-luodi end/ { skip = 0 }' "$1"; }
-hy_block() { # hy_block <是否加 resolver 1|0>
+hy_block() { # hy_block <落地> <是否加 resolver 1|0>
   printf '# wg-luodi begin（WireGuard 落地：wg-luodi 自动加的，卸载时会自动删掉，请不要手动改这一段）\n'
-  printf 'outbounds:\n  - name: wg-luodi\n    type: socks5\n    socks5:\n      addr: 127.0.0.1:%s\n      username: %s\n      password: %s\n' \
-    "$(st_get SOCKS_PORT)" "$(st_get SOCKS_USER)" "$(st_get SOCKS_PASS)"
-  if [ "$1" = 1 ]; then
-    printf 'resolver:\n  type: udp\n  udp:\n    addr: 127.0.0.1:%s\n    timeout: 4s\n' "$(st_get DNS_PORT)"
+  printf 'outbounds:\n  - name: %s\n    type: socks5\n    socks5:\n      addr: 127.0.0.1:%s\n      username: %s\n      password: %s\n' \
+    "$(_ob_tag "$1")" "$(_lget "$1" SOCKS_PORT)" "$(st_get SOCKS_USER)" "$(st_get SOCKS_PASS)"
+  if [ "$2" = 1 ]; then
+    printf 'resolver:\n  type: udp\n  udp:\n    addr: 127.0.0.1:%s\n    timeout: 4s\n' "$(_lget "$1" DNS_PORT)"
   fi
   printf '# wg-luodi end\n'
 }
 
-# transform <类型> <配置> <要走 WG 的端口> <输出文件> [xray 出站格式 new|old]
+# transform <类型> <配置> <映射> <输出文件> [xray 出站格式 new|old]
+# 映射是“端口:落地”空格分隔（比如 31001:us 31002:uk；老布局落地为空：31001:）；空映射 = 全部去掉。
 # 返回 0 = 生成成功；2 = 不能自动改（原因在 TF_ERR）
 transform() {
   TF_ERR=""
   case "$1" in
     xray)
-      "$JQ" --argjson ports "$(_ports_json "$3")" --argjson ob "$(_ob_xray "${5:-old}")" "$JQ_XRAY" "$2" > "$4" 2>/dev/null \
+      "$JQ" --argjson pmap "$(_map_json "$3")" --argjson obs "$(_obs_json xray "$3" "${5:-old}")" "$JQ_XRAY" "$2" > "$4" 2>/dev/null \
         || { TF_ERR="不是标准 JSON（可能带注释），jq 读不了"; return 2; } ;;
     sing-box)
-      "$JQ" --argjson ports "$(_ports_json "$3")" --argjson ob "$(_ob_sb)" "$JQ_SB" "$2" > "$4" 2>/dev/null \
+      "$JQ" --argjson pmap "$(_map_json "$3")" --argjson obs "$(_obs_json sing-box "$3")" "$JQ_SB" "$2" > "$4" 2>/dev/null \
         || { TF_ERR="不是标准 JSON（可能带注释），jq 读不了"; return 2; } ;;
     hysteria)
       hy_strip "$2" > "$4"
       if [ -n "$3" ]; then
         if grep -q '^outbounds:' "$4"; then TF_ERR="配置里已经有你自己写的 outbounds，为了不弄坏它，没有自动改"; return 2; fi
+        _hl=${3%% *}; _hl=${_hl#*:}
         _res=1; grep -q '^resolver:' "$4" && _res=0
         [ -s "$4" ] && [ "$(tail -c 1 "$4" | od -An -c | tr -d ' ')" != '\n' ] && printf '\n' >> "$4"
-        hy_block "$_res" >> "$4"
+        hy_block "$_hl" "$_res" >> "$4"
       fi ;;
     *) TF_ERR="不认识的类型"; return 2 ;;
   esac
@@ -1623,19 +1976,22 @@ apply_one() {
   _k="$1"; _c="$2"; _st="$3"; _sn="$4"; _b="$5"; _al="$6"; _act="$7"; _rs="$8"
   AP_MSG=""; AP_CHANGED=0; _ok=0
   if [ "$_k" = panel ]; then
-    AP_MSG="这是面板（x-ui / 3x-ui 等）管理的配置，面板每次都会重新生成，脚本改不了。请在面板里给这个入站加一条路由：出站用 SOCKS5 127.0.0.1:$(st_get SOCKS_PORT)，用户名 $(st_get SOCKS_USER)，密码见 /etc/wg-luodi/state"
+    _sl=""
+    for _n in $(_landing_names); do _sl="${_sl:+$_sl，}$_n：127.0.0.1:$(_lst_get "$_n" SOCKS_PORT)"; done
+    [ -z "$_sl" ] && _sl="127.0.0.1:$(st_get SOCKS_PORT)"
+    AP_MSG="这是面板（x-ui / 3x-ui 等）管理的配置，面板每次都会重新生成，脚本改不了。请在面板里给这个入站加一条路由：出站用 SOCKS5 $_sl（每个落地一个端口），用户名 $(st_get SOCKS_USER)，密码见 /etc/wg-luodi/state"
     return 2
   fi
   [ -f "$_c" ] || { AP_MSG="配置文件不见了"; return 2; }
-  if [ "$_act" = strip ]; then _wp=""; else _wp=$(cfg_wg_ports "$_k" "$_c" "$_al"); fi
+  if [ "$_act" = strip ]; then _wp=""; _map=""; else _wp=$(cfg_wg_ports "$_k" "$_c" "$_al"); _map=$(_port_map $_wp); fi
   _new="$_c.wgl-new"; [ "$_k" != hysteria ] && _new="$_c.wgl-new.json"
   _fmts="old"; [ "$_k" = xray ] && [ -n "$_wp" ] && [ -x "$_b" ] && _fmts="new old"
   # 第一遍：任何一种写法和现在的配置一样，就说明已经是对的，什么都不用做
   for _fmt in $_fmts; do
-    transform "$_k" "$_c" "$_wp" "$_new" "$_fmt" || { rm -f "$_new"; AP_MSG="$TF_ERR"; return 2; }
+    transform "$_k" "$_c" "$_map" "$_new" "$_fmt" || { rm -f "$_new"; AP_MSG="$TF_ERR"; return 2; }
     if same_cfg "$_k" "$_c" "$_new"; then
       rm -f "$_new"
-      if [ -n "$_wp" ]; then AP_MSG="已经在走 WireGuard（端口 $_wp）"; else AP_MSG="不涉及"; fi
+      if [ -n "$_wp" ]; then AP_MSG="已经在走 WireGuard（$(_map_msg "$_map")）"; else AP_MSG="不涉及"; fi
       return 0
     fi
   done
@@ -1652,7 +2008,7 @@ apply_one() {
   fi
   # 第二遍：生成新配置并检查，通过了才用（Xray 新版出站写法不认就换老写法）
   for _fmt in $_fmts; do
-    transform "$_k" "$_c" "$_wp" "$_new" "$_fmt" || { rm -f "$_new"; AP_MSG="$TF_ERR"; return 2; }
+    transform "$_k" "$_c" "$_map" "$_new" "$_fmt" || { rm -f "$_new"; AP_MSG="$TF_ERR"; return 2; }
     validate_cfg "$_k" "$_new" "$_b"
     case $? in
       0|3) _ok=1; break ;;
@@ -1684,7 +2040,9 @@ apply_one() {
         return 1 ;;
     esac
   fi
-  if [ -n "$_wp" ]; then AP_MSG="已改好：端口 $_wp 走 WireGuard"; else AP_MSG="已去掉 WireGuard 设置"; fi
+  if [ -n "$_wp" ]; then
+    if [ -n "$(_landing_names)" ]; then AP_MSG="已改好：$(_map_msg "$_map")"; else AP_MSG="已改好：端口 $_wp 走 WireGuard"; fi
+  else AP_MSG="已去掉 WireGuard 设置"; fi
   log "$AP_MSG $_c"
   return 0
 }
@@ -1812,7 +2170,7 @@ do_hook() {
   QUIET=1
   installed || exit 0
   find_jq || exit 0
-  PORTS=$(st_get PORTS)
+  PORTS=$(_all_ports)
   case "$1" in ''|*[!0-9]*) exit 0 ;; esac
   INIT=$(st_get INIT)
   _line=$(DISCOVER_XN_ONLY=1 discover_nodes 2>/dev/null | grep -F "$XN_NODES/$1/" | head -n 1)
@@ -1822,9 +2180,10 @@ $_line
 EOF_HOOK
   # 先不加锁看一眼：已经是对的就马上退出（最常见的情况）
   _wp=$(cfg_wg_ports "$k" "$c" "$al")
+  _map=$(_port_map $_wp)
   _tmp="$c.wgl-chk"; [ "$k" != hysteria ] && _tmp="$c.wgl-chk.json"
   for _fmt in new old; do
-    if transform "$k" "$c" "$_wp" "$_tmp" "$_fmt" && same_cfg "$k" "$c" "$_tmp"; then rm -f "$_tmp"; exit 0; fi
+    if transform "$k" "$c" "$_map" "$_tmp" "$_fmt" && same_cfg "$k" "$c" "$_tmp"; then rm -f "$_tmp"; exit 0; fi
     [ "$k" = xray ] || break
   done
   rm -f "$_tmp"
@@ -2013,8 +2372,8 @@ gw_active() {
     *) [ -f "$WGL_DIR/gw.pid" ] && kill -0 "$(cat "$WGL_DIR/gw.pid")" 2>/dev/null ;;
   esac
 }
-gw_wait() { # 等网关的 SOCKS5 端口开始监听
-  _sp=$(st_get SOCKS_PORT); _i=0
+gw_wait() { # gw_wait [落地]：等网关的 SOCKS5 端口开始监听（不给落地就等默认落地的）
+  _sp=$(_lget "${1:-$LND}" SOCKS_PORT); _i=0
   while [ "$_i" -lt "$WGL_WAIT" ]; do
     port_listening "$_sp" tcp && return 0
     _i=$((_i + 1)); sleep 1
@@ -2033,8 +2392,8 @@ ip_via() { # ip_via [curl 参数…] -> 打印 IP
   done
   return 1
 }
-wg_exit_ip() {
-  ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)"
+wg_exit_ip() { # wg_exit_ip [落地]：经这个落地的 SOCKS 入站测出口 IP（不给落地就测默认落地的）
+  ip_via -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(_lget "${1:-$LND}" SOCKS_PORT)"
 }
 server_ip() { ip_via -4 || ip_via -6; }
 # 测下载速度（Mbps）。超时（20 秒）也照样用已经下载的部分算平均速度。
@@ -2142,23 +2501,32 @@ do_status() {
   load_all; find_jq || die "找不到 jq"
   INIT=$(st_get INIT)
   step "wg-luodi 状态（版本 $WGL_VERSION）"
+  _names=${LANDINGS:-""}
   case "$MODE" in
-    kernel) say "  模式：内核网卡模式（网卡 $WGL_IFACE，Table = off，只有带标记的流量走它）" ;;
+    kernel)
+      _ifs=""
+      for _n in ${_names:-""}; do _ifs="$_ifs $(_landing_iface "$_n")"; done
+      say "  模式：内核网卡模式（网卡${_ifs}，Table = off，只有带标记的流量走它）" ;;
     *) say "  模式：无网卡模式（sing-box 里跑 WireGuard，不需要 TUN）" ;;
   esac
-  say "  落地机：${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
-  say "  隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)$( [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in
-      off) if [ -n "$(_l2tp_note)" ]; then echo "（直连没通过检查：WireGuard 套在 L2TP 里面走，速度会比 L2TP 本身慢）"; else echo "（直连不通，走服务器默认的路）"; fi ;; ''|retry) if gw_picking; then echo "（正在选路）"; else echo "（还没选好，巡检时会再试）"; fi ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
-  say "  隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
   if gw_active; then say "  网关服务：运行中"
   elif gw_picking; then say "  网关服务：正在启动（正在选连落地机的路，最多一分钟左右）"
   else printf "  网关服务：${RED}没在运行${NC}（试试 wg-luodi restart）\n"; fi
-  if [ "$MODE" = kernel ] && _has wg; then
-    _hs=$(wg show "$WGL_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
-    if [ -n "$_hs" ] && [ "$_hs" != 0 ]; then say "  最近握手：$(( $(date +%s) - _hs )) 秒前（3 分钟内都正常）"
-    else say "  最近握手：还没有握手（落地机没回应：检查配置、或服务器能不能连到落地机的 UDP 端口）"; fi
-  fi
-  say "  走 WireGuard 的端口：$PORTS"
+  # 每个落地一段：落地机、MTU、握手、端口
+  for _n in ${_names:-""}; do
+    _tag=""; [ -n "$_n" ] && _tag="落地 $_n："
+    if ! _lnd_load "$_n"; then warn "  ${_tag}配置坏了：$PARSE_ERR"; continue; fi
+    say "  ${_tag}落地机 ${WG_EP_HOST}:${WG_EP_PORT}    本端地址：$(printf '%s' "$WG_ADDR" | tr ',' ' ')"
+    say "  ${_tag}隧道 MTU：$(wg_mtu)    连落地机走的网卡：$(_ep_dev_show)$( [ "$MODE" = kernel ] && case "$(_lget "$_n" EP_MARK)" in
+        off) if [ -n "$(_l2tp_note)" ]; then echo "（直连没通过检查：WireGuard 套在 L2TP 里面走，速度会比 L2TP 本身慢）"; else echo "（直连不通，走服务器默认的路）"; fi ;; ''|retry) if gw_picking; then echo "（正在选路）"; else echo "（还没选好，巡检时会再试）"; fi ;; *) echo "（直连，不经过别的全局出口）" ;; esac)"
+    say "  ${_tag}隧道里的 DNS：$WG_DNS1    IP 类型：$(case $WG_STRAT in ipv4_only) echo 只用 IPv4 ;; ipv6_only) echo 只用 IPv6 ;; *) echo IPv4 优先，也支持 IPv6 ;; esac)"
+    if [ "$MODE" = kernel ] && _has wg; then
+      _hs=$(wg show "$(_landing_iface "$_n")" latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+      if [ -n "$_hs" ] && [ "$_hs" != 0 ]; then say "  ${_tag}最近握手：$(( $(date +%s) - _hs )) 秒前（3 分钟内都正常）"
+      else say "  ${_tag}最近握手：还没有握手（落地机没回应：检查配置、或服务器能不能连到落地机的 UDP 端口）"; fi
+    fi
+    say "  ${_tag}走这个落地的端口：$(_lget "$_n" PORTS)"
+  done
   detect_net
   v6_report
   say ""
@@ -2166,27 +2534,35 @@ do_status() {
     say "  网关正在启动，出口 IP 等它好了再测：过一分钟再运行 wg-luodi status"
   else
   say "  正在测出口 IP（要十几秒）…"
-  _sip=$(server_ip); _wip=$(wg_exit_ip)
+  _sip=$(server_ip)
   say "  服务器平时的出口 IP（不走 WireGuard 的流量）：${_sip:-没测出来}"$(_l2tp_note)
-  if [ -n "$_wip" ]; then
-    say "  WireGuard 出口 IP：$_wip"
-    if [ "$_wip" != "$_sip" ]; then info "WireGuard 是通的，出口 IP 和服务器 IP 不一样，分流正常。"
-    else warn "WireGuard 出口 IP 和服务器 IP 一样，请检查落地配置。"; fi
-  else
-    err "通过 WireGuard 访问不了外网。可能原因：配置失效（换了钥匙？）、落地机连不上、或服务器屏蔽了 UDP。"
-  fi
+  for _n in ${_names:-""}; do
+    _tag=""; [ -n "$_n" ] && _tag="落地 $_n："
+    _wip=$(wg_exit_ip "$_n")
+    if [ -n "$_wip" ]; then
+      say "  ${_tag}WireGuard 出口 IP：$_wip"
+      if [ "$_wip" != "$_sip" ]; then info "${_tag}WireGuard 是通的，出口 IP 和服务器 IP 不一样，分流正常。"
+      else warn "${_tag}WireGuard 出口 IP 和服务器 IP 一样，请检查落地配置。"; fi
+    else
+      err "通过 WireGuard${_n:+（落地 $_n）}访问不了外网。可能原因：配置失效（换了钥匙？）、落地机连不上、或服务器屏蔽了 UDP。"
+    fi
+  done
   fi
   say ""
   say "  节点情况："
   QUIET=0
+  _psl=""
+  for _n in $(_landing_names); do _psl="${_psl:+$_psl，}$_n：127.0.0.1:$(_lst_get "$_n" SOCKS_PORT)"; done
+  [ -z "$_psl" ] && _psl="127.0.0.1:$(st_get SOCKS_PORT)"
   discover_nodes | while IFS='|' read -r k c st sn b al; do
     [ -n "$k" ] || continue
-    if [ "$k" = panel ]; then say "  - 面板配置 $c：面板会覆盖改动，脚本不改。请在面板里给这个入站加一个 SOCKS5 出站：127.0.0.1:$(st_get SOCKS_PORT)，用户名 $(st_get SOCKS_USER)，密码 $(st_get SOCKS_PASS)"; continue; fi
+    if [ "$k" = panel ]; then say "  - 面板配置 $c：面板会覆盖改动，脚本不改。请在面板里给这个入站加一个 SOCKS5 出站：$_psl，用户名 $(st_get SOCKS_USER)，密码 $(st_get SOCKS_PASS)"; continue; fi
     _mp=$(cfg_main_port "$k" "$c"); _wp=$(cfg_wg_ports "$k" "$c" "$al")
     _ok="不走 WireGuard（用服务器平时的出口）"
     if [ -n "$_wp" ]; then
-      if [ "$k" = hysteria ]; then grep -q '^# wg-luodi begin' "$c" && _ok="走 WireGuard ✔" || _ok="应该走 WireGuard，但还没改好 ✘"
-      else "$JQ" -e '[.outbounds[]? | select(.tag == "wg-luodi")] | length > 0' "$c" >/dev/null 2>&1 && _ok="走 WireGuard ✔" || _ok="应该走 WireGuard，但还没改好 ✘"; fi
+      _mm=$(_map_msg "$(_port_map $_wp)")
+      if [ "$k" = hysteria ]; then grep -q '^# wg-luodi begin' "$c" && _ok="走 WireGuard ✔（$_mm）" || _ok="应该走 WireGuard，但还没改好 ✘"
+      else "$JQ" -e '[.outbounds[]? | select((.tag // "") | test("^wg-luodi(-|$)"))] | length > 0' "$c" >/dev/null 2>&1 && _ok="走 WireGuard ✔（$_mm）" || _ok="应该走 WireGuard，但还没改好 ✘"; fi
     fi
     say "  - $(kind_cn "$k") 端口 ${_mp:-?}：$_ok    （$c）"
   done
@@ -2297,9 +2673,16 @@ do_test() { # do_test [端口]
   load_all; find_jq || die "找不到 jq"
   INIT=$(st_get INIT)
   step "逐个节点实测出口 IP（每个节点要几秒）"
-  _sip=$(server_ip); _wip=$(wg_exit_ip)
+  _sip=$(server_ip)
   say "  服务器平时的出口 IP（不走 WireGuard 的流量）：${_sip:-没测出来}"$(_l2tp_note)
-  say "  WireGuard 出口 IP：${_wip:-没测出来（WireGuard 不通）}"
+  # 每个落地的出口 IP 先测好（“端口:出口 IP”列在一起，后面按端口所属的落地取）
+  _wips=""
+  for _n in ${LANDINGS:-""}; do
+    _w=$(wg_exit_ip "$_n")
+    _wips="$_wips $_n:$_w"
+    if [ -n "$_n" ]; then say "  落地 $_n 的 WireGuard 出口 IP：${_w:-没测出来（WireGuard 不通）}"
+    else say "  WireGuard 出口 IP：${_w:-没测出来（WireGuard 不通）}"; fi
+  done
   say ""
   _tdir=$(mktemp -d "${TMPDIR:-/tmp}/wgl-test.XXXXXX") || die "建不了临时目录"
   discover_nodes > "$_tdir/list"
@@ -2308,7 +2691,8 @@ do_test() { # do_test [端口]
     for _p in $(cfg_ports "$k" "$c" | sort -n -u); do
       [ -n "$1" ] && [ "$1" != "$_p" ] && continue
       _wp=$(cfg_wg_ports "$k" "$c" "$al")
-      _should="直连"; case " $_wp " in *" $_p "*) _should="WireGuard" ;; esac
+      _should="直连"; _pl=""; _wip=""
+      case " $_wp " in *" $_p "*) _should="WireGuard"; _pl=$(_port_landing "$_p"); _wip=$(printf '%s' "$_wips" | tr ' ' '\n' | sed -n "s/^$_pl://p" | head -n 1) ;; esac
       # 先从 IPv4（127.0.0.1）连进节点测一次；节点也在 IPv6 上监听的话，再从 IPv6（::1）连进去测一次，
       # 确认“客户端填 IPv6 连进来”时出口也对。
       _srvs="127.0.0.1"
@@ -2325,10 +2709,12 @@ do_test() { # do_test [端口]
         _i=0; while [ "$_i" -lt 10 ] && ! port_listening "$_lp" tcp; do _i=$((_i + 1)); sleep 1; done
         _got=$(ip_via -x "http://127.0.0.1:$_lp")
         kill "$_cp" 2>/dev/null; wait "$_cp" 2>/dev/null
+        _allwip=$(printf '%s' "$_wips" | tr ' ' '\n' | sed 's/^[^:]*://' | tr '\n' ' ')
         if [ -z "$_got" ]; then
           _res="${RED}没测通${NC}（节点没响应或这条路不通）"
-        elif [ "$_should" = WireGuard ] && [ "$_got" = "$_wip" ]; then _res="${GREEN}出口 $_got = WireGuard ✔${NC}"
-        elif [ "$_should" = 直连 ] && [ "$_got" != "$_wip" ]; then _res="${GREEN}出口 $_got = 服务器平时的出口 IP ✔${NC}"
+        elif [ "$_should" = WireGuard ] && [ -n "$_wip" ] && [ "$_got" = "$_wip" ]; then _res="${GREEN}出口 $_got = WireGuard ✔${NC}${_pl:+（落地 $_pl）}"
+        elif [ "$_should" = 直连 ]; then
+          case " $_allwip " in *" $_got "*) _res="${RED}出口 $_got，和预期（$_should）不符 ✘${NC}" ;; *) _res="${GREEN}出口 $_got = 服务器平时的出口 IP ✔${NC}" ;; esac
         else _res="${RED}出口 $_got，和预期（$_should）不符 ✘${NC}"; fi
         printf '  - %s 端口 %s，%s（应该走%s）：%b\n' "$(kind_cn "$k")" "$_p" "$_via" "$_should" "$_res"
       done
@@ -2356,15 +2742,25 @@ self_install() {
   chmod 755 "$WGL_CMD.new" && mv -f "$WGL_CMD.new" "$WGL_CMD"
 }
 
-# 网关端口：重装时尽量沿用（节点配置里已经写着这个端口），和你选的端口冲突才换
-pick_gateway_ports() {
-  _sp=$(st_get SOCKS_PORT); _dp=$(st_get DNS_PORT)
-  case " $PORTS " in *" $_sp "*|*" $_dp "*) _sp=""; _dp="" ;; esac
-  if [ -z "$_sp" ] || [ -z "$_dp" ]; then
-    _sp=$(pick_free_port) || die "找不到空闲端口给本机网关用"
-    _dp=$(pick_free_port "$_sp") || die "找不到空闲端口给本机网关用"
+# 网关端口：重装时尽量沿用（节点配置里已经写着这个端口），和节点端口或别的落地的网关端口冲突才换
+pick_gateway_ports() { # pick_gateway_ports [落地]
+  _pl="$1"
+  _sp=$(_lget "$_pl" SOCKS_PORT); _dp=$(_lget "$_pl" DNS_PORT)
+  _taken="$(_all_ports) $(_gateway_ports_all)"
+  _bad=0
+  if [ -z "$_sp" ] || [ -z "$_dp" ]; then _bad=1; fi
+  # 自己现在用的两个端口不算冲突（沿用时它们就在 _gateway_ports_all 里）
+  for _q in $_sp $_dp; do
+    case " $(_all_ports) " in *" $_q "*) _bad=1 ;; esac
+    for _o in $(_gateway_ports_all); do
+      [ "$_o" != "$_sp" ] && [ "$_o" != "$_dp" ] && [ "$_o" = "$_q" ] && _bad=1
+    done
+  done
+  if [ "$_bad" = 1 ]; then
+    _sp=$(pick_free_port $_taken) || die "找不到空闲端口给本机网关用"
+    _dp=$(pick_free_port $_taken "$_sp") || die "找不到空闲端口给本机网关用"
   fi
-  st_set SOCKS_PORT "$_sp"; st_set DNS_PORT "$_dp"
+  _lset "$_pl" SOCKS_PORT "$_sp"; _lset "$_pl" DNS_PORT "$_dp"
   [ -n "$(st_get SOCKS_USER)" ] || st_set SOCKS_USER "wgl$(rand_str 8)"
   [ -n "$(st_get SOCKS_PASS)" ] || st_set SOCKS_PASS "$(rand_str 24)"
 }
@@ -2376,10 +2772,11 @@ gen_gateway() {
   mv -f "$GW_JSON.new" "$GW_JSON"; chmod 600 "$GW_JSON"
 }
 
-start_and_check_gateway() {
+start_and_check_gateway() { # start_and_check_gateway [落地]：重启网关，测这个落地的出口 IP（不给落地就测默认落地的）
+  _sg=${1:-$LND}
   step "[启动] 启动网关并测试 WireGuard"
   gw_restart
-  if ! gw_wait; then
+  if ! gw_wait "$_sg"; then
     err "网关没有启动起来。"
     case "$INIT" in
       systemd) say "  看原因：journalctl -u wg-luodi -n 30 --no-pager" ;;
@@ -2388,12 +2785,13 @@ start_and_check_gateway() {
     return 1
   fi
   info "网关已启动（只在本机 127.0.0.1 上，外面连不上）"
-  WIP=$(wg_exit_ip)
+  WIP=$(wg_exit_ip "$_sg")
+  _sgn=""; [ -n "$_sg" ] && case "$LANDINGS" in *' '*) _sgn="（落地 $_sg）" ;; esac
   if [ -n "$WIP" ]; then
-    info "WireGuard 通了，出口 IP：$WIP"
+    info "WireGuard 通了${_sgn}，出口 IP：$WIP"
   else
-    warn "网关起来了，但通过 WireGuard 访问不了外网。走 WireGuard 的端口暂时会上不了网（不会偷偷改用服务器 IP）。"
-    say "  常见原因：配置过期/钥匙换了、落地机不在线、服务器到落地机的 UDP 被屏蔽。修好后运行 wg-luodi set-conf 换配置。"
+    warn "网关起来了，但通过 WireGuard${_sgn} 访问不了外网。走 WireGuard 的端口暂时会上不了网（不会偷偷改用服务器 IP）。"
+    say "  常见原因：配置过期/钥匙换了、落地机不在线、服务器到落地机的 UDP 被屏蔽。修好后运行 wg-luodi set-conf${_sg:+ $_sg} 换配置。"
   fi
   return 0
 }
@@ -2446,6 +2844,7 @@ _update_rollback() { # _update_rollback <备份目录>
   [ -f "$1/sing-box" ] && _put "$1/sing-box" "$SB"
   [ -f "$1/gw.json" ] && _put "$1/gw.json" "$GW_JSON"
   [ -f "$1/state" ] && _put "$1/state" "$STATE"
+  if [ -d "$1/landings" ]; then rm -rf "$LANDINGS_DIR"; cp -rp "$1/landings" "$LANDINGS_DIR"; fi
   load_all
 }
 
@@ -2469,6 +2868,7 @@ do_update() {
   if [ -f "$SB.new" ] && [ -x "$SB" ]; then ln "$SB" "$_bk/sing-box" 2>/dev/null || cp -p "$SB" "$_bk/sing-box"; fi
   [ -f "$GW_JSON" ] && cp -p "$GW_JSON" "$_bk/gw.json"
   cp -p "$STATE" "$_bk/state"
+  [ -d "$LANDINGS_DIR" ] && cp -rp "$LANDINGS_DIR" "$_bk/landings"
   # 1. 换上新版管理命令和 sing-box
   self_install
   _gw_changed=0
@@ -2484,14 +2884,26 @@ do_update() {
   _svc_before=$(_svc_sum)
   install_services
   [ "$(_svc_sum)" = "$_svc_before" ] || _gw_changed=1
-  # 内核网卡模式还没选过连落地机的路：要重建网卡才能试，这次重启网关
-  [ "$MODE" = kernel ] && case "$(st_get EP_MARK)" in ''|retry) true ;; *) false ;; esac && _gw_changed=1
+  # 内核网卡模式有落地还没选过连落地机的路：要重建网卡才能试，这次重启网关
+  if [ "$MODE" = kernel ]; then
+    if [ -n "$LANDINGS" ]; then
+      for _n in $LANDINGS; do case "$(_lget "$_n" EP_MARK)" in ''|retry) _gw_changed=1 ;; esac; done
+    else
+      case "$(st_get EP_MARK)" in ''|retry) _gw_changed=1 ;; esac
+    fi
+  fi
   # 3. 网关程序、网关配置、开机服务都没变，而且网关现在是通的：不重启网关，走 WireGuard 的节点一秒都不断。
   #    内核网卡模式只把专用路由规则补齐（缺了才加，不删不重建）。
   #    有变化才重启网关并测试；起不来、或者更新前通更新后不通，就换回旧版。
   WIP=""
   if [ "$_gw_changed" = 0 ] && [ -n "$_old_ok" ]; then
-    [ "$MODE" = kernel ] && { _rules_sync; _live_sync; }
+    if [ "$MODE" = kernel ]; then
+      if [ -n "$LANDINGS" ]; then
+        for _n in $LANDINGS; do _rules_sync "$_n"; _live_sync "$_n"; done
+      else
+        _rules_sync; _live_sync
+      fi
+    fi
     WIP=$(wg_exit_ip)
     if [ -z "$WIP" ]; then
       warn "更新后 WireGuard 没测通（更新前是好的），自动换回旧版。"
@@ -2513,7 +2925,7 @@ do_update() {
   rm -rf "$_bk"
   log "更新完成：${_old_ver:-?} → $WGL_VERSION"
   step "更新好了！现在是 $WGL_VERSION 版"
-  say "  走 WireGuard 的端口：$(st_get PORTS)"
+  say "  走 WireGuard 的端口：$(_landings_ports_text)"
   say "  WireGuard 出口 IP：${WIP:-（暂时没测通）}"
   v6_report
   say "  以后管理直接输入：wg-luodi"
@@ -2570,7 +2982,19 @@ do_install() {
   step "[1/2] WireGuard 配置"
   get_conf "$_tc"
   step "[2/2] 端口"
-  get_ports
+  get_ports "$(_all_ports)"
+  # 给这个落地起个名字（以后加别的落地时按名字区分，比如 us、uk、sg）
+  _lname=${WG_LANDING:-}
+  if [ -z "$_lname" ]; then
+    if _can_ask; then
+      say ""
+      ask "给这个落地起个名字（比如 us、uk、sg，只能用小写字母、数字和 -）" "default"
+      _lname="$ANS"
+    else
+      _lname=default
+    fi
+  fi
+  _landing_valid "$_lname" || die "落地名字不对：只能用小写字母、数字和 -，最多 12 个字符，还至少要含一个字母。"
   _req="${WG_MODE:-$(st_get REQ_MODE)}"; _req="${_req:-auto}"
   case "$_req" in auto|kernel|userspace) ;; *) die "WG_MODE 只能是 auto、kernel 或 userspace" ;; esac
   step "[自动] 后面不用你操作了"
@@ -2578,23 +3002,40 @@ do_install() {
   ensure_singbox
   choose_mode "$_req"
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
+  # 重新安装：先把旧落地全清掉（网卡先拆，不然旧网卡名会残留）。网关端口尽量沿用，
+  # 这样节点配置里写的端口不用变，重复安装时节点配置一个字节都不动。
+  _keep_sp=""; _keep_dp=""
+  if [ -n "$(_landing_names)" ]; then
+    case "$(_landing_names)" in *' '*) warn "重新安装会删掉所有旧落地（$(_landings_names_text)），只留新装的这一个。" ;; esac
+    _old_first=$(_landing_names | cut -d' ' -f1)
+    _keep_sp=$(_lst_get "$_old_first" SOCKS_PORT); _keep_dp=$(_lst_get "$_old_first" DNS_PORT)
+    _has ip && kernel_down
+    rm -rf "$LANDINGS_DIR"
+  fi
   [ -f "$CONF" ] && cp -p "$CONF" "$CONF.prev"
-  mv -f "$_tc" "$CONF"; chmod 600 "$CONF"
-  st_set MODE "$MODE"; st_set REQ_MODE "$_req"; st_set PORTS "$PORTS"; st_set EP_FAM "$EP_FAM"; st_set EP_MARK ""
+  mkdir -p "$(_landing_dir "$_lname")"; chmod 700 "$(_landing_dir "$_lname")"
+  mv -f "$_tc" "$(_landing_dir "$_lname")/wg.conf"; chmod 600 "$(_landing_dir "$_lname")/wg.conf"
+  st_set MODE "$MODE"; st_set REQ_MODE "$_req"
   st_set INIT "$INIT"; st_set VERSION "$WGL_VERSION"
-  pick_gateway_ports
+  st_set LANDINGS "$_lname"
+  _lst_set "$_lname" PORTS "$PORTS"; _lst_set "$_lname" EP_FAM "$EP_FAM"; _lst_set "$_lname" EP_MARK ""
+  if [ -n "$_keep_sp" ] && [ -n "$_keep_dp" ]; then
+    _lst_set "$_lname" SOCKS_PORT "$_keep_sp"; _lst_set "$_lname" DNS_PORT "$_keep_dp"
+  fi
+  for _k in PORTS EP_FAM EP_MARK SOCKS_PORT DNS_PORT EP_MTU EP_CHECK; do _st_del "$_k"; done
+  pick_gateway_ports "$_lname"
   gen_gateway
   self_install
   install_services
-  start_and_check_gateway || { _unlock; die "网关启动失败，节点配置没有改动。"; }
+  start_and_check_gateway "$_lname" || { _unlock; die "网关启动失败，节点配置没有改动。"; }
   step "[节点] 给走 WireGuard 的端口改路由"
   rm -f "$WGL_DIR/failed" "$WGL_DIR/v6failed"
   apply_all apply 1
   v6_fix_all
   _unlock
-  log "安装完成：模式 $MODE，端口 $PORTS"
+  log "安装完成：模式 $MODE，落地 $_lname，端口 $PORTS"
   step "装好了！"
-  say "  走 WireGuard 的端口：$PORTS"
+  say "  落地：$_lname，走 WireGuard 的端口：$PORTS"
   say "  WireGuard 出口 IP：${WIP:-（暂时没测通）}"
   v6_report
   say ""
@@ -2607,16 +3048,35 @@ do_install() {
 }
 
 # ---------- 23. 管理命令 ----------
-do_up() { # 网关服务启动前调用：内核网卡模式建网卡，无网卡模式清掉可能残留的网卡
+do_up() { # 网关服务启动前调用：内核网卡模式给每个落地建网卡，无网卡模式清掉可能残留的网卡
   load_all
-  if [ "$MODE" = kernel ]; then kernel_up || exit 1
+  if [ "$MODE" = kernel ]; then
+    if [ -n "$LANDINGS" ]; then
+      for _n in $LANDINGS; do kernel_up "$_n" || exit 1; done
+    else
+      kernel_up || exit 1
+    fi
   else
-    _has ip && ip link show dev "$WGL_IFACE" >/dev/null 2>&1 && kernel_down
-    _has ip && _ep_rule_del
+    if _has ip; then
+      for _n in $LANDINGS; do kernel_down "$_n"; done
+      # 老布局残留的 wg-luodi 网卡和它的直连规则也清掉
+      kernel_down ""
+    fi
   fi
   exit 0
 }
-do_down() { _has ip && kernel_down; exit 0; }
+do_down() {
+  if _has ip; then
+    _names=$(_landing_names)
+    if [ -n "$_names" ]; then
+      for _n in $_names; do kernel_down "$_n"; done
+      kernel_down ""   # 老布局残留的 wg-luodi 网卡也拆掉
+    else
+      kernel_down
+    fi
+  fi
+  exit 0
+}
 
 do_check() {
   QUIET=1
@@ -2627,7 +3087,15 @@ do_check() {
   _IN_CHECK=1
   _lock 0 || exit 0
   if gw_active; then
-    if [ "$MODE" = kernel ] && ! kernel_ensure; then log "要重建网卡（网卡不见了或要重新选路），重启网关"; gw_restart; fi
+    if [ "$MODE" = kernel ]; then
+      _need=0
+      if [ -n "$LANDINGS" ]; then
+        for _n in $LANDINGS; do kernel_ensure "$_n" || _need=1; done
+      else
+        kernel_ensure || _need=1
+      fi
+      if [ "$_need" = 1 ]; then log "要重建网卡（网卡不见了或要重新选路），重启网关"; gw_restart; fi
+    fi
   elif gw_picking; then
     log "网关正在启动（选路中），这次巡检不重启它"
   else
@@ -2639,72 +3107,251 @@ do_check() {
   exit 0
 }
 
-_ports_change() { # _ports_change add|del 端口…
+_ports_change() { # _ports_change add|del [落地] 端口…（只有一个落地时落地名可以省略）
   load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
   shift_act="$1"; shift
+  _lnd=""
+  # 第一个参数是落地名就当落地；带字母又不是落地名，多半是把落地名打错了
+  if [ -n "$1" ]; then
+    case " $(_landing_names) " in *" $1 "*) _lnd="$1"; shift ;;
+    *) case "$1" in *[a-zA-Z]*) die "没有这个落地：$1（现在有：$(_landings_names_text)）" ;; esac ;;
+    esac
+  fi
+  if [ -z "$_lnd" ]; then
+    _rl=0; _resolve_landing "" || _rl=$?
+    if [ "$_rl" = 0 ]; then _lnd="$RL_LANDING"
+    else
+      _can_ask || die "有多个落地，请指定落地：wg-luodi ${shift_act}-port <落地> <端口…>（现在有：$(_landings_names_text)）"
+      if [ "$shift_act" = add ]; then _pick_landing "加端口"; else _pick_landing "去端口"; fi
+      _lnd="$RL_LANDING"
+    fi
+  fi
+  _cur=$(_lget "$_lnd" PORTS)
   _in="$*"
   if [ -z "$_in" ]; then
-    say "现在走 WireGuard 的端口：$PORTS"
+    if [ -n "$_lnd" ]; then say "落地 $_lnd 现在走 WireGuard 的端口：${_cur:-（还没有）}"; else say "现在走 WireGuard 的端口：$PORTS"; fi
     if [ "$shift_act" = add ]; then ask "要加哪些端口？可以填多个，用空格隔开" ""; else ask "要去掉哪些端口？可以填多个，用空格隔开" ""; fi
     _in="$ANS"
   fi
   parse_ports "$_in" || die "$PARSE_ERR"
+  if [ "$shift_act" = add ]; then _check_ports_free "$_lnd" $PORTS_OUT; fi
   _new=""
   if [ "$shift_act" = add ]; then
-    _new="$PORTS $PORTS_OUT"
+    _new="$_cur $PORTS_OUT"
   else
-    for _p in $PORTS; do case " $PORTS_OUT " in *" $_p "*) ;; *) _new="$_new $_p" ;; esac; done
+    for _p in $_cur; do case " $PORTS_OUT " in *" $_p "*) ;; *) _new="$_new $_p" ;; esac; done
   fi
   _new=$(printf '%s\n' $_new | grep -E '^[0-9]+$' | sort -n -u | tr '\n' ' ' | sed 's/ $//')
-  _sp=$(st_get SOCKS_PORT); _dp=$(st_get DNS_PORT)
-  case " $_new " in *" $_sp "*|*" $_dp "*) die "端口 $_sp / $_dp 是本机网关自己在用的，不能当节点端口。" ;; esac
-  [ -n "$_new" ] || die "至少要留一个端口。想全部去掉请用卸载：wg-luodi uninstall"
+  # 所有落地加起来至少要留一个端口
+  _u=""
+  for _n in $LANDINGS; do if [ "$_n" = "$_lnd" ]; then _u="$_u $_new"; else _u="$_u $(_lst_get "$_n" PORTS)"; fi; done
+  [ -n "$LANDINGS" ] || _u="$_new"
+  if [ -z "$(printf '%s' "$_u" | tr -d ' ')" ]; then
+    _multi=0; case "$LANDINGS" in *' '*) _multi=1 ;; esac
+    if [ -n "$_lnd" ] && [ "$_multi" = 1 ]; then
+      die "至少要留一个端口。想把落地 $_lnd 整个删掉请用：wg-luodi del-landing $_lnd"
+    else
+      die "至少要留一个端口。想全部去掉请用卸载：wg-luodi uninstall"
+    fi
+  fi
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
-  PORTS="$_new"; st_set PORTS "$PORTS"
+  _lset "$_lnd" PORTS "$_new"
+  PORTS=$(_all_ports)
   rm -f "$WGL_DIR/failed"
   step "更新节点"
   apply_all apply 1
   v6_fix_all
   _unlock
-  info "现在走 WireGuard 的端口：$PORTS"
+  if [ -n "$_lnd" ]; then info "落地 $_lnd 现在走 WireGuard 的端口：${_new:-（还没有）}"; else info "现在走 WireGuard 的端口：$PORTS"; fi
 }
 
-do_set_conf() { # do_set_conf [文件]：换一份 WireGuard 配置（换钥匙时用）。节点配置不用动。
+do_set_conf() { # do_set_conf [落地] [文件]：换某个落地的 WireGuard 配置（换钥匙时用）。节点配置不用动。
   load_all; find_jq || die "找不到 jq"
   detect_os; detect_virt; detect_net; INIT=$(st_get INIT)
-  [ -n "$1" ] && WG_CONF_FILE="$1"
+  _lnd=""; _file=""
+  # 第一个参数：已有的落地名就是落地；已有的文件就是配置文件；像落地名又不是落地，多半是打错了
+  if [ -n "$1" ]; then
+    case " $LANDINGS " in *" $1 "*) _lnd="$1"; _file="$2" ;;
+    *) if [ -f "$1" ]; then _file="$1"
+       elif _landing_valid "$1"; then die "没有这个落地：$1（现在有：$(_landings_names_text)）"
+       else _file="$1"; fi ;;
+    esac
+  fi
+  if [ -z "$_lnd" ]; then
+    _rl=0; _resolve_landing "" || _rl=$?
+    if [ "$_rl" = 0 ]; then _lnd="$RL_LANDING"
+    elif _can_ask; then _pick_landing "换配置"; _lnd="$RL_LANDING"
+    else die "有多个落地，请指定落地：wg-luodi set-conf <落地> [文件]（现在有：$(_landings_names_text)）"; fi
+  fi
+  [ -n "$_file" ] && WG_CONF_FILE="$_file"
   _tc="$WGL_DIR/wg.conf.new"
   get_conf "$_tc"
   check_endpoint
   _new_fam="$EP_FAM"
+  if [ -n "$_lnd" ]; then _cf="$(_landing_dir "$_lnd")/wg.conf"; else _cf="$CONF"; fi
   _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
   # 先看看旧配置现在通不通：通的话，新配置测不通就自动换回旧的（防止贴错配置把好好的隧道弄断）
-  _old_ok=""; _old_fam=$(st_get EP_FAM)
-  gw_active && _old_ok=$(wg_exit_ip)
-  cp -p "$CONF" "$CONF.prev"
-  mv -f "$_tc" "$CONF"; chmod 600 "$CONF"
-  st_set EP_FAM "$_new_fam"; st_set EP_MARK ""
+  _old_ok=""; _old_fam=$(_lget "$_lnd" EP_FAM)
+  gw_active && _old_ok=$(wg_exit_ip "$_lnd")
+  cp -p "$_cf" "$_cf.prev"
+  mv -f "$_tc" "$_cf"; chmod 600 "$_cf"
+  _lset "$_lnd" EP_FAM "$_new_fam"; _lset "$_lnd" EP_MARK ""
   if ! write_gw_json "$GW_JSON.new" || ! "$SB" check -c "$GW_JSON.new" >/dev/null 2>&1; then
-    mv -f "$CONF.prev" "$CONF"; st_set EP_FAM "$_old_fam"; rm -f "$GW_JSON.new"; _unlock
+    mv -f "$_cf.prev" "$_cf"; _lset "$_lnd" EP_FAM "$_old_fam"; rm -f "$GW_JSON.new"; _unlock
     die "新配置生成的网关配置没通过检查，已换回旧配置。"
   fi
   cp -p "$GW_JSON" "$GW_JSON.prev" 2>/dev/null
   mv -f "$GW_JSON.new" "$GW_JSON"
-  start_and_check_gateway
+  start_and_check_gateway "$_lnd"
   if [ -z "$WIP" ] && [ -n "$_old_ok" ] && [ "${WG_KEEP_NEW:-0}" != 1 ]; then
     warn "新配置测不通，旧配置刚才是通的，自动换回旧配置。"
-    cp -p "$CONF" "$CONF.bad"; chmod 600 "$CONF.bad"
-    mv -f "$CONF.prev" "$CONF"; st_set EP_FAM "$_old_fam"
+    cp -p "$_cf" "$_cf.bad"; chmod 600 "$_cf.bad"
+    mv -f "$_cf.prev" "$_cf"; _lset "$_lnd" EP_FAM "$_old_fam"
     if [ -f "$GW_JSON.prev" ]; then mv -f "$GW_JSON.prev" "$GW_JSON"; else load_all; write_gw_json "$GW_JSON"; fi
-    start_and_check_gateway
+    start_and_check_gateway "$_lnd"
     _unlock
-    say "  测不通的新配置留在 $CONF.bad（权限 600）。确定要用它（比如落地机还没开好），运行：WG_KEEP_NEW=1 wg-luodi set-conf $CONF.bad"
+    say "  测不通的新配置留在 $_cf.bad（权限 600）。确定要用它（比如落地机还没开好），运行：WG_KEEP_NEW=1 wg-luodi set-conf${_lnd:+ $_lnd} $_cf.bad"
     return 1
   fi
   rm -f "$GW_JSON.prev"
   # 隧道支持的 IP 类型变了（比如新配置没有 IPv6），节点不用改：网关自己处理
   _unlock
-  info "WireGuard 配置已更换。旧配置留在 $CONF.prev（权限 600）。"
+  info "WireGuard 配置已更换${_lnd:+（落地 $_lnd）}。旧配置留在 $_cf.prev（权限 600）。"
+}
+
+# ---------- 23b. 落地管理：加 / 删 / 列出 / 改名 ----------
+do_add_landing() { # do_add_landing [名字]：再加一份 WireGuard 配置（比如已经有 us，再加 uk）
+  load_all; find_jq || die "找不到 jq"
+  [ -n "$LANDINGS" ] || die "老布局的状态不全，没法加落地。请先重新安装（wg-luodi install）。"
+  detect_os; detect_virt; detect_net; INIT=$(st_get INIT)
+  _name=${1:-${WG_LANDING:-}}
+  if [ -z "$_name" ]; then
+    _can_ask || die "请指定落地名字：wg-luodi add-landing uk（或设 WG_LANDING）"
+    say ""
+    ask "给这个落地起个名字（比如 uk、sg，只能用小写字母、数字和 -）" ""
+    _name="$ANS"
+  fi
+  _landing_valid "$_name" || die "落地名字不对：只能用小写字母、数字和 -，最多 12 个字符，还至少要含一个字母。"
+  case " $LANDINGS " in *" $_name "*) die "已经有落地 $_name 了。" ;; esac
+  _tc="$WGL_DIR/wg.conf.new"
+  step "[1/2] WireGuard 配置（落地 $_name）"
+  get_conf "$_tc"
+  step "[2/2] 端口（走落地 $_name 的节点端口）"
+  get_ports ""
+  _check_ports_free "$_name" $PORTS
+  check_endpoint
+  _new_fam="$EP_FAM"
+  _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
+  mkdir -p "$(_landing_dir "$_name")"; chmod 700 "$(_landing_dir "$_name")"
+  mv -f "$_tc" "$(_landing_dir "$_name")/wg.conf"; chmod 600 "$(_landing_dir "$_name")/wg.conf"
+  _lst_set "$_name" PORTS "$PORTS"; _lst_set "$_name" EP_FAM "$_new_fam"; _lst_set "$_name" EP_MARK ""
+  pick_gateway_ports "$_name"
+  _old_landings="$LANDINGS"
+  st_set LANDINGS "${LANDINGS:+$LANDINGS }$_name"
+  LANDINGS="${LANDINGS:+$LANDINGS }$_name"
+  gen_gateway
+  if ! start_and_check_gateway "$_name"; then
+    warn "新落地的网关启动失败，撤销这次添加。"
+    rm -rf "$(_landing_dir "$_name")"
+    st_set LANDINGS "$_old_landings"; LANDINGS="$_old_landings"
+    gen_gateway; gw_restart
+    _unlock
+    die "落地 $_name 没加上，之前的状态没变。"
+  fi
+  step "[节点] 给走这个落地的端口改路由"
+  rm -f "$WGL_DIR/failed" "$WGL_DIR/v6failed"
+  PORTS=$(_all_ports)
+  apply_all apply 1
+  v6_fix_all
+  _unlock
+  log "添加落地 $_name：端口 $(_lst_get "$_name" PORTS)"
+  info "落地 $_name 已添加：端口 $(_lst_get "$_name" PORTS) 走 $_name，出口 IP：${WIP:-（暂时没测通）}"
+}
+
+do_del_landing() { # do_del_landing <名字> [-y]：删掉一个落地，它的端口恢复成不走 WireGuard
+  load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
+  _name="$1"
+  if [ -z "$_name" ]; then
+    _can_ask || die "请指定要删的落地：wg-luodi del-landing uk"
+    ask "要删哪个落地？（现在有：$(_landings_names_text)）" ""; _name="$ANS"
+  fi
+  case " $LANDINGS " in *" $_name "*) ;; *) die "没有这个落地：$_name（现在有：$(_landings_names_text)）" ;; esac
+  case "$LANDINGS" in *' '*) ;; *) die "只剩落地 $_name 一个了，删掉它就等于卸载：请用 wg-luodi uninstall" ;; esac
+  if [ "$2" != "-y" ] && [ "${WG_YES:-0}" != 1 ]; then
+    say "删除落地 $_name 会：它的端口（$(_lst_get "$_name" PORTS)）恢复成不走 WireGuard，删掉它的配置和网卡。"
+    ask "确定要删除吗？输入 y 确认" "N"
+    case "$ANS" in y|Y|yes|YES) ;; *) say "已取消。"; return 0 ;; esac
+  fi
+  _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
+  step "[1/3] 恢复这个落地的节点端口"
+  _lst_set "$_name" PORTS ""
+  PORTS=$(_all_ports)
+  rm -f "$WGL_DIR/failed"
+  apply_all apply 1
+  step "[2/3] 拆掉网卡、去掉这个落地"
+  # 标记、路由表按落地在列表里的序号排，删掉一个会让后面的序号前移：网卡全拆掉，剩下的落地重新选路，
+  # 网关重启时按新序号重建，就不会出现“新旧标记对不上”的情况。
+  _has ip && kernel_down
+  for _n in $LANDINGS; do [ "$_n" != "$_name" ] && _lst_set "$_n" EP_MARK ""; done
+  rm -rf "$(_landing_dir "$_name")"
+  _rest=""; for _n in $LANDINGS; do [ "$_n" != "$_name" ] && _rest="$_rest $_n"; done
+  st_set LANDINGS "${_rest# }"
+  LANDINGS="${_rest# }"
+  gen_gateway
+  step "[3/3] 重启网关"
+  gw_restart
+  gw_wait || warn "网关重启后没起来，试试 wg-luodi restart"
+  _unlock
+  log "删除落地 $_name"
+  info "落地 $_name 已删除，它的端口现在用服务器平时的出口。"
+}
+
+do_landings() { # 列出各落地：名字、落地机、端口、出口 IP
+  load_all
+  step "落地列表"
+  if [ -z "$LANDINGS" ]; then
+    say "  还没有落地（老布局）。运行 wg-luodi update 迁移成多落地布局。"
+    return 0
+  fi
+  _up=""; gw_active && _up=1
+  for _n in $LANDINGS; do
+    if ! _lnd_load "$_n"; then warn "  $_n：配置坏了：$PARSE_ERR"; continue; fi
+    _wip=""; [ -n "$_up" ] && _wip=$(wg_exit_ip "$_n")
+    say "  $_n：落地机 ${WG_EP_HOST}:${WG_EP_PORT}，端口 $(_lst_get "$_n" PORTS)，出口 IP ${_wip:-没测出来}"
+  done
+  say ""
+  say "  加落地：wg-luodi add-landing <名字>；删落地：wg-luodi del-landing <名字>；改名：wg-luodi rename-landing <旧> <新>"
+}
+
+do_rename_landing() { # do_rename_landing <旧> <新>：给落地改名（网关、节点、状态一起改）
+  load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
+  _old="$1"; _new="$2"
+  if [ -z "$_old" ]; then
+    _can_ask || die "请指定要改名的落地：wg-luodi rename-landing default us"
+    ask "要给哪个落地改名？（现在有：$(_landings_names_text)）" ""; _old="$ANS"
+  fi
+  case " $LANDINGS " in *" $_old "*) ;; *) die "没有这个落地：$_old（现在有：$(_landings_names_text)）" ;; esac
+  if [ -z "$_new" ]; then
+    _can_ask || die "请指定新名字：wg-luodi rename-landing $_old <新名字>"
+    ask "改成什么名字？（只能用小写字母、数字和 -）" ""; _new="$ANS"
+  fi
+  _landing_valid "$_new" || die "新名字不对：只能用小写字母、数字和 -，最多 12 个字符，还至少要含一个字母。"
+  case " $LANDINGS " in *" $_new "*) die "已经有落地 $_new 了。" ;; esac
+  _lock 60 || die "另一个 wg-luodi 正在运行，请稍后再试。"
+  _has ip && kernel_down "$_old"   # 旧网卡名（wg-<旧>）不用了，先拆掉；新网卡在网关重启时重建
+  mv "$(_landing_dir "$_old")" "$(_landing_dir "$_new")"
+  _nl=""; for _n in $LANDINGS; do if [ "$_n" = "$_old" ]; then _nl="$_nl $_new"; else _nl="$_nl $_n"; fi; done
+  st_set LANDINGS "${_nl# }"
+  LANDINGS="${_nl# }"
+  gen_gateway
+  gw_restart
+  gw_wait || warn "网关重启后没起来，试试 wg-luodi restart"
+  PORTS=$(_all_ports)
+  step "更新节点（出站 tag 从 wg-luodi-$_old 换成 wg-luodi-$_new）"
+  apply_all apply 1
+  _unlock
+  log "落地改名：$_old → $_new"
+  info "落地 $_old 已改名成 $_new。"
 }
 
 do_mode() { # do_mode auto|kernel|userspace
@@ -2726,7 +3373,8 @@ do_mode() { # do_mode auto|kernel|userspace
   # 先按旧模式停掉网关（会拆掉旧网卡），再换配置启动
   case "$INIT" in systemd) systemctl stop wg-luodi.service >/dev/null 2>&1 ;; openrc) rc-service wg-luodi stop >/dev/null 2>&1 ;; *) _gw_kill ;; esac
   _has ip && kernel_down
-  st_set MODE "$MODE"; st_set REQ_MODE "$_req"; st_set EP_MARK ""
+  st_set MODE "$MODE"; st_set REQ_MODE "$_req"
+  if [ -n "$LANDINGS" ]; then for _n in $LANDINGS; do _lst_set "$_n" EP_MARK ""; done; else st_set EP_MARK ""; fi
   gen_gateway
   start_and_check_gateway; _rc=$?
   _unlock
@@ -2771,7 +3419,7 @@ do_uninstall() {
   discover_nodes | while IFS='|' read -r k c st sn b al; do
     [ "$k" = hysteria ] && grep -q '^# wg-luodi begin' "$c" 2>/dev/null && exit 1
     [ "$k" = xray ] || [ "$k" = sing-box ] || continue
-    "$JQ" -e '[.outbounds[]? | select(.tag == "wg-luodi")] | length > 0' "$c" >/dev/null 2>&1 && exit 1
+    "$JQ" -e '[.outbounds[]? | select((.tag // "") | test("^wg-luodi(-|$)"))] | length > 0' "$c" >/dev/null 2>&1 && exit 1
     true   # 这个节点已经干净了（没有这行，最后一个节点干净时循环会返回 1，被误判成“没恢复”）
   done || _bad=1
   step "[2/3] 删除网关服务"
@@ -2795,16 +3443,22 @@ do_uninstall() {
 #   ① 直接用 WireGuard 网卡下载（不经过节点、不经过网关）= 落地机 + 线路本身能跑多快；
 #   ② 同上开 4 个连接 = 落地机总带宽还有没有余量（单个连接是不是被延迟/丢包卡住）；
 #   ③ 经本机网关下载 = 节点实际走的路；④ 服务器平时的出口（装了 L2TP 就是 L2TP）用来对比。
-do_speed() {
+do_speed() { # do_speed [落地]：测这个落地的速度（不给落地就测第一个落地）
   load_all; find_jq || die "找不到 jq"; INIT=$(st_get INIT)
+  _rl=0; _resolve_landing "$1" || _rl=$?
+  if [ "$_rl" = 1 ]; then die "没有这个落地：$1（现在有：$(_landings_names_text)）"; fi
+  if [ "$_rl" = 2 ]; then RL_LANDING="${LANDINGS%% *}"; _def_note=1; fi
+  _lnd="$RL_LANDING"
+  [ -n "$_lnd" ] && _lnd_load "$_lnd"
   step "测速（每项下载 25MB，最多 20 秒，全部测完一两分钟）"
+  if [ -n "$_lnd" ]; then say "  落地：$_lnd${_def_note:+（有多个落地，没指定就默认测第一个；测别的：wg-luodi speed <落地名>）}"; fi
   if [ "$MODE" = kernel ]; then
     say "  WireGuard 连落地机走的网卡：$(_ep_dev_show)    隧道 MTU：$(wg_mtu)"
-    [ "$(st_get EP_MARK)" = off ] && [ -n "$(_l2tp_note)" ] && \
+    [ "$(_lget "$_lnd" EP_MARK)" = off ] && [ -n "$(_l2tp_note)" ] && \
       warn "WireGuard 现在套在 L2TP 里面走（每个包包两层），速度不会超过 L2TP。直连没通过检查，详情看 /etc/wg-luodi/log"
   fi
   say "  CPU：$(nproc 2>/dev/null || echo '?') 核    当前负载：$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null || echo '?')"
-  if [ "$MODE" = kernel ]; then _rw=$(_rtt -m "$WGL_MARK"); else _rw=""; fi
+  if [ "$MODE" = kernel ]; then _rw=$(_rtt -m "$(_landing_mark "$_lnd")"); else _rw=""; fi
   _rd=$(_rtt)
   say "  到 1.1.1.1 的延迟：经 WireGuard ${_rw:-测不出来} ms，经服务器平时的出口 ${_rd:-测不出来} ms"
   gw_active || { err "网关没在运行，测不了 WireGuard 的速度（试试 wg-luodi restart）"; return 1; }
@@ -2812,12 +3466,12 @@ do_speed() {
   if [ "$MODE" = kernel ]; then
     if [ "$WG_HAS4" = 1 ]; then _fam=-4; else _fam=-6; fi
     say "  ① 直接用 WireGuard 网卡下载（不经过节点和网关）…"
-    _raw=$(_speed "$_fam" --interface "$WGL_IFACE")
+    _raw=$(_speed "$_fam" --interface "$(_landing_iface "$_lnd")")
     say "  ② 同上，同时开 4 个连接…"
-    _raw4=$(_speed_par 4 "$_fam" --interface "$WGL_IFACE")
+    _raw4=$(_speed_par 4 "$_fam" --interface "$(_landing_iface "$_lnd")")
   fi
   say "  ③ 经本机网关下载（节点实际走的路）…"
-  _w=$(_speed -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(st_get SOCKS_PORT)")
+  _w=$(_speed -x "socks5h://$(st_get SOCKS_USER):$(st_get SOCKS_PASS)@127.0.0.1:$(_lget "$_lnd" SOCKS_PORT)")
   say "  ④ 经服务器平时的出口下载…"
   _d=$(_speed)
   say ""
@@ -2833,18 +3487,22 @@ do_menu() {
   need_root
   installed || { do_install; return; }
   while :; do
-    printf "\n${BOLD}wg-luodi 管理菜单${NC}（模式：%s，端口：%s）\n" "$(st_get MODE)" "$(st_get PORTS)"
+    printf "\n${BOLD}wg-luodi 管理菜单${NC}（模式：%s，落地：%s）\n" "$(st_get MODE)" "$(_landings_names_text)"
     say "  1) 查看状态（握手、出口 IP、节点情况）"
     say "  2) 逐个节点实测出口 IP"
     say "  3) 添加走 WireGuard 的端口"
     say "  4) 去掉走 WireGuard 的端口"
-    say "  5) 更换 WireGuard 配置（换钥匙 / 换落地机）"
+    say "  5) 更换某个落地的 WireGuard 配置（换钥匙 / 换落地机）"
     say "  6) 切换模式（内核网卡 / 无网卡）"
     say "  7) 重新应用（节点被别的脚本重建后用）"
     say "  8) 重启网关"
     say "  9) 卸载（恢复所有节点、删除全部）"
     say "  10) 更新 wg-luodi 到最新版（配置、端口都保留）"
     say "  11) 测速（WireGuard 和服务器平时的出口对比）"
+    say "  12) 添加一个落地（再加一份 WireGuard 配置）"
+    say "  13) 删除一个落地"
+    say "  14) 落地列表（各落地的端口和出口 IP）"
+    say "  15) 给落地改名"
     say "  0) 退出"
     ask "请选择" 1
     case "$ANS" in
@@ -2859,6 +3517,10 @@ do_menu() {
       9) do_uninstall; return 0 ;;
       10) ( do_self_update ) && say "  请重新输入 wg-luodi 打开新版菜单。"; return 0 ;;
       11) ( do_speed ) ;;
+      12) ( do_add_landing ) ;;
+      13) ( do_del_landing ) ;;
+      14) ( do_landings ) ;;
+      15) ( do_rename_landing ) ;;
       0|q|Q) return 0 ;;
       *) warn "没有这个选项" ;;
     esac
@@ -2871,10 +3533,14 @@ wg-luodi $WGL_VERSION —— WireGuard 落地管理
   wg-luodi                 打开中文菜单
   wg-luodi status          查看状态和出口 IP
   wg-luodi test [端口]      逐个节点实测出口 IP
-  wg-luodi speed           测速：WireGuard 和服务器平时的出口对比
-  wg-luodi add-port 端口…   添加走 WireGuard 的端口
-  wg-luodi del-port 端口…   去掉走 WireGuard 的端口
-  wg-luodi set-conf [文件]  更换 WireGuard 配置（不给文件就让你粘贴）
+  wg-luodi speed [落地]     测速：WireGuard 和服务器平时的出口对比（不给落地就测第一个）
+  wg-luodi add-port [落地] 端口…   添加走 WireGuard 的端口（只有一个落地时落地名可以省略）
+  wg-luodi del-port [落地] 端口…   去掉走 WireGuard 的端口
+  wg-luodi set-conf [落地] [文件]  更换某个落地的 WireGuard 配置（不给文件就让你粘贴）
+  wg-luodi landings        列出所有落地（名字、端口、出口 IP）
+  wg-luodi add-landing [名字]   再加一个落地（多份 WireGuard 配置同时在线）
+  wg-luodi del-landing <名字> [-y]   删除一个落地（它的端口恢复成不走 WireGuard）
+  wg-luodi rename-landing <旧> <新>   给落地改名
   wg-luodi mode auto|kernel|userspace   切换模式（userspace = 强制无网卡模式）
   wg-luodi reapply         重新给所有节点应用设置
   wg-luodi restart         重启网关
@@ -2895,10 +3561,14 @@ main() {
     down) do_down ;;
     status) need_root; do_status ;;
     test) need_root; do_test "$2" ;;
-    speed) need_root; do_speed ;;
+    speed) need_root; do_speed "$2" ;;
     add-port) need_root; shift; _ports_change add "$@" ;;
     del-port|remove-port) need_root; shift; _ports_change del "$@" ;;
-    set-conf|replace-conf) need_root; do_set_conf "$2" ;;
+    set-conf|replace-conf) need_root; do_set_conf "$2" "$3" ;;
+    landings|list-landings) need_root; do_landings ;;
+    add-landing) need_root; do_add_landing "$2" ;;
+    del-landing|remove-landing) need_root; do_del_landing "$2" "$3" ;;
+    rename-landing) need_root; do_rename_landing "$2" "$3" ;;
     mode) need_root; do_mode "$2" ;;
     reapply) need_root; do_reapply ;;
     restart) need_root; do_restart ;;

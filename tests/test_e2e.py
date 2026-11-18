@@ -132,9 +132,9 @@ class E2E(unittest.TestCase):
         r = sb.run([], env | {"PATH": sb.env["PATH"]}, timeout=400)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("WireGuard 通了，出口 IP：%s" % WG_IP, r.stdout)
-        st = (sb.etc / "state").read_text()
-        self.assertIn("PORTS=%s" % " ".join(map(str, sorted(wgp))), st)
-        self.assertEqual(oct((sb.etc / "wg.conf").stat().st_mode & 0o777), "0o600")
+        lst = (sb.etc / "landings" / "default" / "state").read_text()
+        self.assertIn("PORTS=%s" % " ".join(map(str, sorted(wgp))), lst)
+        self.assertEqual(oct((sb.etc / "landings" / "default" / "wg.conf").stat().st_mode & 0o777), "0o600")
         self.assertTrue((sb.initd / "wg-luodi").exists())
         self.assertIn("rc-update add wg-luodi default", sb.fake_log())
         self.assertIn("rc-update add wg-luodi-watch default", sb.fake_log())
@@ -145,7 +145,8 @@ class E2E(unittest.TestCase):
 
         # ---- 3. DNS 也走隧道：echo.test 只有落地机的 DNS 认识 ----
         st = dict(l.split("=", 1) for l in (sb.etc / "state").read_text().splitlines())
-        c = subprocess.run(["curl", "-s", "--max-time", "10", "-x", "socks5h://%s:%s@127.0.0.1:%s" % (st["SOCKS_USER"], st["SOCKS_PASS"], st["SOCKS_PORT"]),
+        lst = dict(l.split("=", 1) for l in (sb.etc / "landings" / "default" / "state").read_text().splitlines())
+        c = subprocess.run(["curl", "-s", "--max-time", "10", "-x", "socks5h://%s:%s@127.0.0.1:%s" % (st["SOCKS_USER"], st["SOCKS_PASS"], lst["SOCKS_PORT"]),
                             "http://echo.test:%d/" % self.e1], capture_output=True, text=True)
         self.assertEqual(c.stdout, WG_IP)
 
@@ -190,15 +191,15 @@ class E2E(unittest.TestCase):
         r = sb.run_cmd(["set-conf", str(self.conf_file(new_priv, "wg-new.conf"))], timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("WireGuard 通了，出口 IP：%s" % WG_IP, r.stdout)
-        self.assertIn(new_priv, (sb.etc / "wg.conf").read_text())
+        self.assertIn(new_priv, (sb.etc / "landings" / "default" / "wg.conf").read_text())
         # 7b. 贴错配置（落地机不认这把钥匙），而现在的配置是通的：自动换回现在的配置
         bad_priv, _ = wg_keypair()
         r = sb.run_cmd(["set-conf", str(self.conf_file(bad_priv, "wg-bad.conf"))], timeout=300)
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("自动换回旧配置", r.stdout + r.stderr)
-        self.assertIn(new_priv, (sb.etc / "wg.conf").read_text())
-        self.assertIn(bad_priv, (sb.etc / "wg.conf.bad").read_text())
-        self.assertEqual(oct((sb.etc / "wg.conf.bad").stat().st_mode & 0o777), "0o600")
+        self.assertIn(new_priv, (sb.etc / "landings" / "default" / "wg.conf").read_text())
+        self.assertIn(bad_priv, (sb.etc / "landings" / "default" / "wg.conf.bad").read_text())
+        self.assertEqual(oct((sb.etc / "landings" / "default" / "wg.conf.bad").stat().st_mode & 0o777), "0o600")
         self.assertIn("WireGuard 通了，出口 IP：%s" % WG_IP, r.stdout)
         r = sb.run_cmd(["test", str(p[1])], timeout=200)
         self.check_test_output(r.stdout, [p[1]], [])
@@ -210,20 +211,20 @@ class E2E(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("MODE=kernel", (sb.etc / "state").read_text())
         log = sb.fake_log()
-        for want in ("ip link add dev wg-luodi type wireguard", "wg setconf wg-luodi",
-                     "ip -4 addr add 10.66.0.2/32 dev wg-luodi", "ip link set dev wg-luodi mtu 1420 up",
-                     "ip -4 route replace default dev wg-luodi table 51888",
+        for want in ("ip link add dev wg-default type wireguard", "wg setconf wg-default",
+                     "ip -4 addr add 10.66.0.2/32 dev wg-default", "ip link set dev wg-default mtu 1420 up",
+                     "ip -4 route replace default dev wg-default table 51888",
                      "ip -4 rule add fwmark 51888 lookup 51888 pref 5188"):
             self.assertIn(want, log)
         for line in log.splitlines():   # 绝不碰主路由表的默认路由
             if "route" in line and "default" in line and "show" not in line:
                 self.assertIn("table 51888", line)
-        self.assertFalse((sb.etc / "wireguard" / "wg-luodi-setconf.conf").exists())          # 临时钥匙文件不留
+        self.assertFalse((sb.etc / "wireguard" / "wg-default-setconf.conf").exists())        # 临时钥匙文件不留
         gw = json.loads((sb.etc / "gw.json").read_text())
         self.assertEqual(gw["outbounds"][0]["routing_mark"], 51888)
         r = sb.run_cmd(["mode", "userspace"], timeout=300)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("ip link del dev wg-luodi", sb.fake_log())
+        self.assertIn("ip link del dev wg-default", sb.fake_log())
         self.assertIn("WireGuard 通了", r.stdout)
 
         # ---- 9. 模拟重启：所有进程被杀，再按开机顺序启动 ----
@@ -239,17 +240,17 @@ class E2E(unittest.TestCase):
 
         # ---- 9b. 更新：装过的机器再跑一次安装命令（不给配置/端口）= 自动更新，配置端口都保留 ----
         snap = {k: v.read_bytes() for k, v in self.cfg.items()}
-        conf_before = (sb.etc / "wg.conf").read_bytes()
+        conf_before = (sb.etc / "landings" / "default" / "wg.conf").read_bytes()
         st_path = sb.etc / "state"
         st_path.write_text(st_path.read_text().replace("VERSION=", "VERSION=0.9.") )   # 假装装的是旧版
         r = sb.run([], timeout=400)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("自动更新到", r.stdout)
         self.assertIn("更新好了", r.stdout)
-        self.assertIn("WireGuard 通了，出口 IP：%s" % WG_IP, r.stdout)
+        self.assertIn("WireGuard 出口 IP：%s" % WG_IP, r.stdout)
         ver = [l for l in st_path.read_text().splitlines() if l.startswith("VERSION=")][0]
         self.assertNotIn("0.9.", ver)
-        self.assertEqual(conf_before, (sb.etc / "wg.conf").read_bytes())
+        self.assertEqual(conf_before, (sb.etc / "landings" / "default" / "wg.conf").read_bytes())
         self.assertEqual(snap, {k: v.read_bytes() for k, v in self.cfg.items()})
         self.assertFalse((sb.etc / "update-backup").exists())
         r = sb.run_cmd(["test"], timeout=400)
@@ -263,7 +264,7 @@ class E2E(unittest.TestCase):
 
         # ---- 9d. 新版有问题（生成的网关配置不合格）：自动换回旧版，什么都不变 ----
         bad = sb.tmp / "bad-wg-luodi.sh"
-        bad.write_text(Path(SCRIPT).read_text().replace('{ type: "socks", tag: "socks-in"', '{ type: "sockz", tag: "socks-in"')
+        bad.write_text(Path(SCRIPT).read_text().replace('{ type: "socks", tag: .stag', '{ type: "sockz", tag: .stag')
                        .replace('WGL_VERSION="', 'WGL_VERSION="9'))
         cmd_before, gw_before, st_before = sb.cmd.read_bytes(), (sb.etc / "gw.json").read_bytes(), st_path.read_bytes()
         r = sb.run_cmd(["update"], {"WGL_RAW_URL": "file://%s" % bad}, timeout=400)

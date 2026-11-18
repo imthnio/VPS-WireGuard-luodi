@@ -83,9 +83,9 @@ case "$*" in
   *"rule del"*) exit 1 ;;
   *"rule show"*) [ -n "$FAKE_IP_RULES" ] && printf '%b' "$FAKE_IP_RULES"; exit 0 ;;
   "link add dev wgl-probe0 type wireguard") [ "$FAKE_NO_KMOD" = 1 ] && exit 1; exit 0 ;;
-  "link show dev wg-luodi") [ -f "$FAKE_LOG.link" ] && exit 0 || exit 1 ;;
-  "link add dev wg-luodi type wireguard") touch "$FAKE_LOG.link"; exit 0 ;;
-  "link del dev wg-luodi") [ -f "$FAKE_LOG.link" ] || exit 1; rm -f "$FAKE_LOG.link"; exit 0 ;;
+  "link show dev wg-"*) [ -f "$FAKE_LOG.link" ] && exit 0 || exit 1 ;;
+  "link add dev wg-"*) touch "$FAKE_LOG.link"; exit 0 ;;
+  "link del dev wg-"*) [ -f "$FAKE_LOG.link" ] || exit 1; rm -f "$FAKE_LOG.link"; exit 0 ;;
 esac
 exit 0
 '''

@@ -1,5 +1,8 @@
 """wg-luodi 的单元测试：解析配置、粘贴、端口、生成网关配置、改节点配置（不跑网络）。"""
+import base64
 import json
+import os
+import shutil
 import subprocess
 import unittest
 import uuid
@@ -7,6 +10,11 @@ from pathlib import Path
 
 from helpers import (BIN, SCRIPT, Sandbox, have_bins, hy2_yaml, make_node, rand_key, reality_keypair,
                      sb_anytls_reality, wg_conf, xray_ss, xray_vless_reality, xray_vmess_ws)
+
+
+def ss_key():
+    """2022-blake3-aes-128-gcm 的合法密码：16 字节的 base64（rand_key 是 32 字节，xray -test 会报 bad key）。"""
+    return base64.b64encode(os.urandom(16)).decode()
 
 
 class SyntaxTest(unittest.TestCase):
@@ -288,6 +296,190 @@ class EpMarkTest(unittest.TestCase):
         self.assertEqual(r.stdout.split(), ["rc=0", "149122"], r.stderr)   # 已经选好的不动
 
 
+class MultiLandingTest(unittest.TestCase):
+    """多落地：名字、标记递增、多出口网关、老布局迁移。"""
+
+    def setUp(self):
+        self.sb = Sandbox()
+        self.sb.etc.mkdir()
+        self.names = ["us", "uk", "sg"]
+        (self.sb.etc / "state").write_text(
+            "LANDINGS=us uk sg\nMODE=userspace\nSOCKS_USER=wgltest\nSOCKS_PASS=pw%s\n" % uuid.uuid4().hex[:8])
+        self.make_landing("us", "31001", 40001, 40002)
+        self.make_landing("uk", "31002", 40003, 40004, address="10.66.0.3/32, fd00::3/128",
+                          allowed="0.0.0.0/0, ::/0")
+        self.make_landing("sg", "31003", 40005, 40006)
+
+    def tearDown(self):
+        self.sb.cleanup()
+
+    def make_landing(self, name, ports, socks, dns, **kw):
+        d = self.sb.etc / "landings" / name
+        d.mkdir(parents=True)
+        (d / "wg.conf").write_text(wg_conf(rand_key(), rand_key(), kw.get("ep", "1.2.3.4:51820"),
+                                           address=kw.get("address", "10.66.0.2/32"),
+                                           allowed=kw.get("allowed", "0.0.0.0/0")))
+        (d / "state").write_text("PORTS=%s\nEP_FAM=4\nEP_MARK=\nSOCKS_PORT=%d\nDNS_PORT=%d\n" % (ports, socks, dns))
+        return d
+
+    def gw_json(self, mode):
+        out = self.sb.tmp / ("gw-%s.json" % mode)
+        r = self.sb.source('MODE=%s; write_gw_json "%s"' % (mode, out))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        j = json.loads(out.read_text())
+        if have_bins():
+            c = subprocess.run([BIN + "/sing-box", "check", "-c", str(out)], capture_output=True, text=True)
+            self.assertEqual(c.returncode, 0, c.stderr)
+        return j
+
+    def test_landing_names(self):
+        (self.sb.etc / "state").write_text("LANDINGS=us uk-1 BAD_name toolongname1234\n")
+        r = self.sb.source('_landing_names; echo; _landing_valid us && echo us-ok; _landing_valid US || echo US-bad; '
+                           '_landing_valid a_b || echo ab-bad; _landing_valid abcdefghijklm || echo long-bad; '
+                           '_landing_valid uk-1 && echo uk1-ok')
+        lines = r.stdout.splitlines()
+        self.assertEqual(lines[0], "us uk-1")          # 非法名字（大写、下划线、超 12 字符）被滤掉
+        self.assertEqual(lines[1:], ["us-ok", "US-bad", "ab-bad", "long-bad", "uk1-ok"])
+        # LANDINGS 键丢了（比如更新回滚）：按目录里的落地算
+        (self.sb.etc / "state").write_text("MODE=userspace\n")
+        r = self.sb.source('_landing_names')
+        self.assertEqual(r.stdout, "sg uk us")
+
+    def test_marks_increment(self):
+        r = self.sb.source('for n in us uk sg; do echo "$n $(_landing_mark $n) $(_landing_table $n) $(_landing_pref $n) $(_landing_epmark $n) $(_landing_iface $n)"; done; '
+                           'echo "legacy $(_landing_mark "") $(_landing_iface "")"')
+        self.assertEqual(r.stdout.splitlines(), [
+            "us 51888 51888 5188 51889 wg-us",
+            "uk 51889 51889 5189 51890 wg-uk",
+            "sg 51890 51890 5190 51891 wg-sg",
+            "legacy 51888 wg-luodi",
+        ])
+
+    def test_ep_candidates_per_landing(self):
+        r = self.sb.source('LND=uk; _ep_cands', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
+        self.assertEqual(r.stdout.strip(), "51890")   # 第二个落地试自己的标记，不抢第一个的 51889
+        r = self.sb.source('LND=uk; _ep_cands', {"WGL_L2TP_DIR": str(self.sb.tmp / "none"),
+                                                 "FAKE_IP_RULES": "8906:\\tfrom all fwmark 0x24682 lookup main\\n"})
+        self.assertEqual(r.stdout.strip(), "51890")   # 没装 L2TP-VPS：规则在也不借它的标记
+
+    def test_gw_json_multi_userspace(self):
+        j = self.gw_json("userspace")
+        self.assertEqual([e["tag"] for e in j["endpoints"]], ["wg-us", "wg-uk", "wg-sg"])
+        self.assertTrue(all(e["system"] is False for e in j["endpoints"]))       # 不建网卡、不要 TUN
+        ib = {x["tag"]: x for x in j["inbounds"]}
+        self.assertEqual(sorted(ib), ["dns-sg", "dns-uk", "dns-us", "socks-sg", "socks-uk", "socks-us"])
+        self.assertEqual([ib["socks-" + n]["listen_port"] for n in self.names], [40001, 40003, 40005])
+        self.assertEqual([ib["dns-" + n]["listen_port"] for n in self.names], [40002, 40004, 40006])
+        self.assertTrue(all(x["listen"] == "127.0.0.1" for x in j["inbounds"]))  # 网关只听本机
+        self.assertEqual(ib["socks-us"]["users"], ib["socks-uk"]["users"])       # 共用一对用户名密码
+        rules = j["route"]["rules"]
+        self.assertEqual([r for r in rules if r.get("action") == "hijack-dns"],
+                         [{"inbound": ["dns-" + n], "action": "hijack-dns"} for n in self.names])
+        self.assertEqual([r for r in rules if "outbound" in r],
+                         [{"inbound": ["socks-" + n], "outbound": "wg-" + n} for n in self.names])
+        rej = [r for r in rules if r.get("action") == "reject"]
+        self.assertEqual(rej, [{"inbound": ["socks-us"], "ip_cidr": ["::/0"], "action": "reject", "no_drop": True},
+                               {"inbound": ["socks-sg"], "ip_cidr": ["::/0"], "action": "reject", "no_drop": True}])
+        self.assertEqual(j["route"]["final"], "wg-us")                            # final 指向第一个落地
+        srv = {s["tag"]: s for s in j["dns"]["servers"]}
+        self.assertEqual(srv["wg-dns-us"], {"type": "udp", "tag": "wg-dns-us", "server": "10.66.0.1",
+                                            "detour": "wg-us"})
+        self.assertEqual(srv["wg-dns-uk"]["detour"], "wg-uk")
+        self.assertEqual(j["dns"]["strategy"], "ipv4_only")   # 全局策略用第一个落地的
+        self.assertEqual(j["dns"]["rules"], [{"inbound": ["dns-" + n], "server": "wg-dns-" + n} for n in self.names])
+        self.assertEqual(j["dns"]["final"], "wg-dns-us")
+        self.assertEqual(j["route"]["default_domain_resolver"], {"server": "wg-dns-us", "strategy": "ipv4_only"})
+        self.assertNotIn("outbounds", j)
+
+    def test_gw_json_multi_kernel(self):
+        j = self.gw_json("kernel")
+        self.assertEqual(j["outbounds"], [
+            {"type": "direct", "tag": "wg-out-us", "bind_interface": "wg-us", "routing_mark": 51888},
+            {"type": "direct", "tag": "wg-out-uk", "bind_interface": "wg-uk", "routing_mark": 51889},
+            {"type": "direct", "tag": "wg-out-sg", "bind_interface": "wg-sg", "routing_mark": 51890},
+        ])
+        self.assertNotIn("endpoints", j)
+        self.assertEqual(j["route"]["final"], "wg-out-us")
+        self.assertEqual([r for r in j["route"]["rules"] if "outbound" in r],
+                         [{"inbound": ["socks-" + n], "outbound": "wg-out-" + n} for n in self.names])
+        srv = {s["tag"]: s for s in j["dns"]["servers"]}
+        self.assertEqual(srv["wg-dns-uk"],
+                         {"type": "udp", "tag": "wg-dns-uk", "server": "10.66.0.1",
+                          "bind_interface": "wg-uk", "routing_mark": 51889})
+        self.assertNotIn("local", srv)   # 内核模式不用 local 解析器
+
+    def test_kernel_up_down_per_landing(self):
+        (self.sb.etc / "landings" / "us" / "state").write_text(
+            "PORTS=31001\nEP_FAM=4\nEP_MARK=51889\nEP_CHECK=3\nSOCKS_PORT=40001\nDNS_PORT=40002\n")
+        r = self.sb.source('MODE=kernel; kernel_up us; echo "RC=$?"')
+        self.assertIn("RC=0", r.stdout, r.stderr)
+        log = self.sb.fake_log()
+        for want in ("ip link add dev wg-us type wireguard", "wg setconf wg-us",
+                     "ip -4 addr add 10.66.0.2/32 dev wg-us",
+                     "ip -4 route replace default dev wg-us table 51888",
+                     "ip -4 rule add fwmark 51888 lookup 51888 pref 5188",
+                     "ip -4 rule add fwmark 51889 lookup main pref 5189"):
+            self.assertIn(want, log)
+        self.assertNotIn("dev wg-luodi", log)      # 不碰老布局的网卡名
+        open(self.sb.env["FAKE_LOG"], "w").close()
+        r = self.sb.source('kernel_down')           # 不给名字：所有落地各拆一张
+        self.assertEqual(r.returncode, 0, r.stderr)
+        log = self.sb.fake_log()
+        for want in ("ip link del dev wg-us", "ip link del dev wg-uk", "ip link del dev wg-sg",
+                     "ip -4 rule del fwmark 51888 lookup 51888 pref 5188",
+                     "ip -4 rule del fwmark 51889 lookup 51889 pref 5189",
+                     "ip -4 route flush table 51890"):
+            self.assertIn(want, log)
+
+    def test_migrate_legacy(self):
+        etc = self.sb.tmp / "legacy"
+        etc.mkdir()
+        conf = wg_conf(rand_key(), rand_key(), "5.6.7.8:51820")
+        (etc / "wg.conf").write_text(conf)
+        (etc / "state").write_text("MODE=userspace\nPORTS=31001 31002\nEP_FAM=4\nEP_MARK=\n"
+                                   "SOCKS_PORT=40001\nDNS_PORT=40002\nSOCKS_USER=u1\nSOCKS_PASS=p1\nVERSION=1.1.20\n")
+        r = self.sb.source('migrate_legacy; echo "LANDINGS=$(st_get LANDINGS)"', {"WGL_DIR": str(etc)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("LANDINGS=default", r.stdout)
+        d = etc / "landings" / "default"
+        self.assertEqual((d / "wg.conf").read_text(), conf)
+        st = dict(l.split("=", 1) for l in (d / "state").read_text().splitlines())
+        self.assertEqual((st["PORTS"], st["EP_FAM"], st["SOCKS_PORT"], st["DNS_PORT"]),
+                         ("31001 31002", "4", "40001", "40002"))
+        self.assertIn("EP_MARK", st)
+        self.assertEqual((etc / "wg.conf.prev").read_text(), conf)     # 老配置留一份 .prev 备份
+        before = (d / "state").read_bytes()
+        self.sb.source('migrate_legacy', {"WGL_DIR": str(etc)})        # 幂等：再迁一次什么都不变
+        self.assertEqual((d / "state").read_bytes(), before)
+        gstate = (etc / "state").read_text()                            # 全局 state 里的旧键迁完就删掉
+        for k in ("PORTS=", "EP_FAM=", "EP_MARK=", "SOCKS_PORT=", "DNS_PORT="):
+            self.assertNotIn(k, gstate)
+        gw = json.loads((etc / "gw.json").read_text())                 # 迁移时网关配置已按新布局生成
+        self.assertEqual(gw["endpoints"][0]["tag"], "wg-default")
+        self.assertEqual(gw["inbounds"][0]["tag"], "socks-default")
+        self.assertEqual(gw["inbounds"][0]["listen_port"], 40001)
+        r = self.sb.source('load_all; echo "PORTS=$PORTS LND=$LND MODE=$MODE EP=$WG_EP_HOST"',
+                           {"WGL_DIR": str(etc)})
+        self.assertIn("PORTS=31001 31002 LND=default MODE=userspace EP=5.6.7.8", r.stdout)
+
+    def test_landing_name_needs_a_letter(self):
+        # 全是数字的名字会和端口分不清（add-port uk 31001 里 31001 是端口不是落地）
+        r = self.sb.source('_landing_valid 31001 || echo digits-bad; _landing_valid us1 && echo us1-ok; '
+                           '_landing_valid 1a && echo 1a-ok; _landing_valid -- || echo dash-bad')
+        self.assertEqual(r.stdout.split(), ["digits-bad", "us1-ok", "1a-ok", "dash-bad"])
+
+    def test_port_landing_and_union(self):
+        r = self.sb.source('echo "us=$(_port_landing 31001) uk=$(_port_landing 31002) sg=$(_port_landing 31003) none=$(_port_landing 9999)"; '
+                           'echo "ALL=$(_all_ports)"; echo "MAP=$(_port_map 31002 31001 31003)"; '
+                           'echo "MSG=$(_map_msg "31001:us 31002:uk")"')
+        self.assertEqual(r.stdout.splitlines(), [
+            "us=us uk=uk sg=sg none=",
+            "ALL=31001 31002 31003",
+            "MAP=31002:uk 31001:us 31003:sg",
+            "MSG=端口 31001 走 us，端口 31002 走 uk",
+        ])
+
+
 @unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")
 class GatewayAndPatchTest(unittest.TestCase):
     def setUp(self):
@@ -439,6 +631,214 @@ class GatewayAndPatchTest(unittest.TestCase):
         r = self.sb.source("find_jq; apply_one panel /usr/local/x-ui/bin/config.json none - x '' apply 0; echo \"RC=$? $AP_MSG\"")
         self.assertIn("RC=2", r.stdout)
         self.assertIn("面板", r.stdout)
+
+
+@unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")
+class MultiPatchTest(unittest.TestCase):
+    """多落地：不同端口走不同落地、端口归属冲突、删落地、老 tag 迁移。"""
+
+    def setUp(self):
+        self.sb = Sandbox()
+        self.sb.etc.mkdir()
+        (self.sb.etc / "state").write_text(
+            "LANDINGS=us uk\nMODE=userspace\nINIT=openrc\nSOCKS_USER=wgltest\nSOCKS_PASS=pw%s\n" % uuid.uuid4().hex[:8])
+        self.make_landing("us", "31001", 40001, 40002)
+        self.make_landing("uk", "31002", 40003, 40004)
+
+    def tearDown(self):
+        self.sb.cleanup()
+
+    def make_landing(self, name, ports, socks, dns):
+        d = self.sb.etc / "landings" / name
+        d.mkdir(parents=True)
+        (d / "wg.conf").write_text(wg_conf(rand_key(), rand_key(), "1.2.3.4:51820"))
+        (d / "state").write_text("PORTS=%s\nEP_FAM=4\nEP_MARK=\nSOCKS_PORT=%d\nDNS_PORT=%d\n" % (ports, socks, dns))
+        return d
+
+    def apply(self, ports, kind, cfg, act="apply", alias=""):
+        b = {"xray": "xray", "sing-box": "sing-box", "hysteria": "hysteria"}[kind]
+        return self.sb.source('find_jq; PORTS="%s"; apply_one %s "%s" none - "%s/%s" "%s" %s 0; echo "RC=$? $AP_MSG"'
+                              % (ports, kind, cfg, BIN, b, alias, act))
+
+    def validate(self, kind, cfg):
+        if kind == "xray":
+            r = subprocess.run([BIN + "/xray", "-test", "-config", str(cfg)], capture_output=True, text=True)
+        else:
+            r = subprocess.run([BIN + "/sing-box", "check", "-c", str(cfg)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_xray_two_ports_two_landings(self):
+        priv, _ = reality_keypair()
+        conf = xray_vless_reality(31001, str(uuid.uuid4()), priv, "abcd")
+        conf["inbounds"].append(xray_ss(31002, ss_key())["inbounds"][0])
+        cfg = make_node(self.sb, 1, "xray", conf)
+        orig = cfg.read_bytes()
+        r = self.apply("31001 31002", "xray", cfg)
+        self.assertIn("RC=0 已改好", r.stdout, r.stderr)
+        self.assertIn("31001 走 us", r.stdout)
+        self.assertIn("31002 走 uk", r.stdout)
+        j = json.loads(cfg.read_text())
+        obs = {o["tag"]: o for o in j["outbounds"] if o.get("tag", "").startswith("wg-luodi")}
+        self.assertEqual(sorted(obs), ["wg-luodi-uk", "wg-luodi-us"])
+
+        def socks_port(ob):   # 新版写法 settings.port，老版写法 settings.servers[0].port
+            s = ob["settings"]
+            return s.get("port") or s["servers"][0]["port"]
+
+        self.assertEqual(socks_port(obs["wg-luodi-us"]), 40001)
+        self.assertEqual(socks_port(obs["wg-luodi-uk"]), 40003)
+        rules = [x for x in j["routing"]["rules"] if x.get("outboundTag", "").startswith("wg-luodi")]
+        self.assertEqual(rules, [
+            {"type": "field", "inboundTag": ["wg-luodi-in-31002"], "outboundTag": "wg-luodi-uk"},
+            {"type": "field", "inboundTag": ["wg-luodi-in-31001"], "outboundTag": "wg-luodi-us"},
+        ])
+        self.validate("xray", cfg)
+        once = cfg.read_bytes()
+        self.assertIn("已经在走", self.apply("31001 31002", "xray", cfg).stdout)
+        self.assertEqual(once, cfg.read_bytes())                              # 第二次什么都不改
+        self.apply("31001 31002", "xray", cfg, act="strip")
+        self.assertEqual(orig, cfg.read_bytes())                              # 卸载后逐字节还原
+
+    def test_singbox_two_ports_two_landings(self):
+        priv, _ = reality_keypair()
+        conf = sb_anytls_reality(31001, "pw", priv, "abcd")
+        conf["inbounds"].append({"type": "shadowsocks", "listen": "0.0.0.0", "listen_port": 31002,
+                                 "method": "2022-blake3-aes-128-gcm", "password": rand_key()})
+        cfg = make_node(self.sb, 2, "sing-box", conf)
+        orig = cfg.read_bytes()
+        self.assertIn("RC=0 已改好", self.apply("31001 31002", "sing-box", cfg).stdout)
+        j = json.loads(cfg.read_text())
+        obs = {o["tag"]: o for o in j["outbounds"] if o.get("tag", "").startswith("wg-luodi")}
+        self.assertEqual(sorted(obs), ["wg-luodi-uk", "wg-luodi-us"])
+        self.assertEqual(obs["wg-luodi-us"]["server_port"], 40001)
+        self.assertEqual(obs["wg-luodi-uk"]["server_port"], 40003)
+        rules = [x for x in j["route"]["rules"] if x.get("outbound", "").startswith("wg-luodi")]
+        self.assertEqual(rules, [
+            {"inbound": ["wg-luodi-in-31002"], "outbound": "wg-luodi-uk"},
+            {"inbound": ["wg-luodi-in-31001"], "outbound": "wg-luodi-us"},
+        ])
+        self.validate("sing-box", cfg)
+        self.apply("31001 31002", "sing-box", cfg, act="strip")
+        self.assertEqual(orig, cfg.read_bytes())
+
+    def test_hysteria_uses_its_ports_landing(self):
+        nd = self.sb.nodes / "3"
+        nd.mkdir(parents=True)
+        cfg = make_node(self.sb, 3, "hysteria", hy2_yaml(31002, nd, "p" * 32, "o" * 32))
+        orig = cfg.read_bytes()
+        self.assertIn("RC=0", self.apply("31002", "hysteria", cfg).stdout)
+        text = cfg.read_text()
+        self.assertIn("name: wg-luodi-uk", text)
+        self.assertIn("addr: 127.0.0.1:40003", text)
+        self.assertIn("addr: 127.0.0.1:40004", text)   # DNS 也走 uk 的隧道
+        self.apply("31002", "hysteria", cfg, act="strip")
+        self.assertEqual(orig, cfg.read_bytes())
+
+    def test_port_conflict_across_landings(self):
+        r = self.sb.source('_ports_change add uk 31001; echo "RC=$?"')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("已经在走落地 us", r.stdout + r.stderr)
+        self.assertIn("del-port us 31001", r.stdout + r.stderr)
+        # 加到同一个落地是允许的（已经在里面了，等于没变化）
+        r = self.sb.source('_ports_change add us 31001; echo "RC=$?"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_add_port_to_landing_patches_node(self):
+        cfg = make_node(self.sb, 4, "xray", xray_ss(31009, ss_key()))
+        r = self.sb.source('_ports_change add us 31009; echo "RC=$?"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        j = json.loads(cfg.read_text())
+        self.assertIn("wg-luodi-us", [o.get("tag") for o in j["outbounds"]])
+        st = dict(l.split("=", 1) for l in (self.sb.etc / "landings" / "us" / "state").read_text().splitlines())
+        self.assertEqual(st["PORTS"], "31001 31009")
+        r = self.sb.source('_ports_change del us 31009; echo "RC=$?"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        j = json.loads(cfg.read_text())
+        self.assertNotIn("wg-luodi-us", [o.get("tag") for o in j["outbounds"]])
+
+    def test_del_landing_restores_its_ports(self):
+        shutil.copy(BIN + "/sing-box", str(self.sb.lib / "sing-box"))
+        shutil.copy(str(SCRIPT), str(self.sb.cmd))   # 假 rc-service 重启网关时要跑 wg-luodi up/down
+        self.sb.cmd.chmod(0o755)
+        priv, _ = reality_keypair()
+        conf = xray_vless_reality(31001, str(uuid.uuid4()), priv, "abcd")
+        conf["inbounds"].append(xray_ss(31002, ss_key())["inbounds"][0])
+        cfg = make_node(self.sb, 5, "xray", conf)
+        self.assertIn("RC=0", self.apply("31001 31002", "xray", cfg).stdout)
+        r = self.sb.source('do_del_landing us -y; echo "RC=$?"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.sb.etc / "landings" / "us").exists())
+        st = (self.sb.etc / "state").read_text()
+        self.assertIn("LANDINGS=uk", st)
+        j = json.loads(cfg.read_text())
+        tags = [o.get("tag") for o in j["outbounds"]]
+        self.assertNotIn("wg-luodi-us", tags)          # us 的出站和规则没了
+        self.assertIn("wg-luodi-uk", tags)             # uk 的还在
+        rules = [x for x in j["routing"]["rules"] if x.get("outboundTag", "").startswith("wg-luodi")]
+        self.assertEqual(rules, [{"type": "field", "inboundTag": ["wg-luodi-in-31002"], "outboundTag": "wg-luodi-uk"}])
+        self.validate("xray", cfg)
+
+    def test_add_landing(self):
+        shutil.copy(BIN + "/sing-box", str(self.sb.lib / "sing-box"))
+        shutil.copy(str(SCRIPT), str(self.sb.cmd))   # 假 rc-service 重启网关时要跑 wg-luodi up/down
+        self.sb.cmd.chmod(0o755)
+        conf = self.sb.tmp / "sg.conf"
+        conf.write_text(wg_conf(rand_key(), rand_key(), "1.2.3.4:51820"))
+        cfg = make_node(self.sb, 7, "xray", xray_ss(31009, ss_key()))
+        r = self.sb.source('do_add_landing sg; echo "RC=$?"',
+                           {"WG_CONF_FILE": str(conf), "WG_PORTS": "31009"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("LANDINGS=us uk sg", (self.sb.etc / "state").read_text())
+        st = dict(l.split("=", 1) for l in (self.sb.etc / "landings" / "sg" / "state").read_text().splitlines())
+        self.assertEqual(st["PORTS"], "31009")
+        j = json.loads(cfg.read_text())
+        self.assertIn("wg-luodi-sg", [o.get("tag") for o in j["outbounds"]])
+        gw = json.loads((self.sb.etc / "gw.json").read_text())
+        self.assertIn("wg-sg", [e["tag"] for e in gw["endpoints"]])
+        # 再加一次同名落地：报错
+        r = self.sb.source('do_add_landing sg; echo "RC=$?"',
+                           {"WG_CONF_FILE": str(conf), "WG_PORTS": "31010"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("已经有落地 sg", r.stdout + r.stderr)
+
+    def test_rename_landing(self):
+        shutil.copy(BIN + "/sing-box", str(self.sb.lib / "sing-box"))
+        shutil.copy(str(SCRIPT), str(self.sb.cmd))
+        self.sb.cmd.chmod(0o755)
+        cfg = make_node(self.sb, 8, "xray", xray_ss(31001, ss_key()))
+        self.assertIn("RC=0", self.apply("31001", "xray", cfg).stdout)
+        r = self.sb.source('do_rename_landing us usa; echo "RC=$?"')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((self.sb.etc / "landings" / "us").exists())
+        self.assertTrue((self.sb.etc / "landings" / "usa" / "wg.conf").exists())
+        self.assertIn("LANDINGS=usa uk", (self.sb.etc / "state").read_text())
+        j = json.loads(cfg.read_text())
+        tags = [o.get("tag") for o in j["outbounds"]]
+        self.assertIn("wg-luodi-usa", tags)
+        self.assertNotIn("wg-luodi-us", tags)
+        self.validate("xray", cfg)
+
+    def test_migrated_node_old_tag_is_replaced(self):
+        # 先按老布局改好节点（单出站 wg-luodi），再迁移：第一次重新应用就换成 wg-luodi-default
+        etc = self.sb.etc
+        (etc / "wg.conf").write_text(wg_conf(rand_key(), rand_key(), "5.6.7.8:51820"))
+        (etc / "state").write_text("MODE=userspace\nPORTS=31001\nEP_FAM=4\nEP_MARK=\n"
+                                   "SOCKS_PORT=40001\nDNS_PORT=40002\nSOCKS_USER=wgltest\nSOCKS_PASS=pw1\n")
+        shutil.rmtree(etc / "landings")
+        cfg = make_node(self.sb, 6, "xray", xray_ss(31001, ss_key()))
+        self.assertIn("RC=0 已改好", self.apply("31001", "xray", cfg).stdout)
+        self.assertIn('"wg-luodi"', cfg.read_text())
+        self.sb.source('migrate_legacy')
+        self.assertIn("RC=0 已改好", self.apply("31001", "xray", cfg).stdout)
+        j = json.loads(cfg.read_text())
+        tags = [o.get("tag") for o in j["outbounds"]]
+        self.assertIn("wg-luodi-default", tags)
+        self.assertNotIn("wg-luodi", tags)
+        rules = [x for x in j["routing"]["rules"] if x.get("outboundTag", "").startswith("wg-luodi")]
+        self.assertEqual(rules, [{"type": "field", "inboundTag": ["wg-luodi-in-31001"],
+                                  "outboundTag": "wg-luodi-default"}])
+        self.validate("xray", cfg)
+        self.assertIn("已经在走", self.apply("31001", "xray", cfg).stdout)   # 再跑一次就不动了
 
 
 if __name__ == "__main__":
