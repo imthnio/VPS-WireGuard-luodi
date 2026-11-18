@@ -25,6 +25,31 @@ PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"; U=htt
 只有 IPv6 的服务器连不上 GitHub，把上面这一行里的 `U=https://raw.githubusercontent.com/...`
 改成 `U=https://v6.gh-proxy.org/https://raw.githubusercontent.com/...` 再运行。
 
+## 多个落地同时在线
+
+手里有好几份 WireGuard 配置（比如美国、英国、新加坡各一份），想让不同端口的节点走不同落地？
+先按上面装好第一个（比如叫 `us`），再加另外两个：
+
+```bash
+wg-luodi add-landing uk   # 粘贴英国的配置，再选走 uk 的端口
+wg-luodi add-landing sg   # 粘贴新加坡的配置，再选走 sg 的端口
+```
+
+每个端口最多属于一个落地。常用命令：
+
+```bash
+wg-luodi landings                    # 列出所有落地：名字、端口、出口 IP
+wg-luodi add-port uk 45192 50000     # 把端口加到 uk（只有一个落地时落地名可以省略）
+wg-luodi del-port uk 45192           # 把端口从 uk 去掉
+wg-luodi set-conf uk                 # 换 uk 的配置（换钥匙时用）
+wg-luodi speed uk                    # 测 uk 这条路的速度
+wg-luodi del-landing sg              # 删掉 sg，它的端口恢复成不走 WireGuard
+wg-luodi rename-landing default us   # 给落地改名
+```
+
+老版本升级上来时，原来的那份配置会自动变成一个叫 `default` 的落地，端口和网关端口都保留，
+节点配置第一次重新应用时会自动换成新格式（节点会重启一次）。想改名字就用 `rename-landing`。
+
 ## 赞赏支持
 如果这个脚本帮到了你，欢迎请我喝杯咖啡 ☕  
 微信扫一扫下方赞赏码即可：
