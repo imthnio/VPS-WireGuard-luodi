@@ -346,21 +346,29 @@ class MultiLandingTest(unittest.TestCase):
         self.assertEqual(r.stdout, "sg uk us")
 
     def test_marks_increment(self):
-        r = self.sb.source('for n in us uk sg; do echo "$n $(_landing_mark $n) $(_landing_table $n) $(_landing_pref $n) $(_landing_epmark $n) $(_landing_iface $n)"; done; '
+        r = self.sb.source('for n in us uk sg; do echo "$n $(_landing_mark $n) $(_landing_table $n) $(_landing_pref $n) $(_landing_epmark $n) $(_landing_eppref $n) $(_landing_iface $n)"; done; '
                            'echo "legacy $(_landing_mark "") $(_landing_iface "")"')
         self.assertEqual(r.stdout.splitlines(), [
-            "us 51888 51888 5188 51889 wg-us",
-            "uk 51889 51889 5189 51890 wg-uk",
-            "sg 51890 51890 5190 51891 wg-sg",
+            "us 51888 51888 5188 51889 5189 wg-us",
+            "uk 51890 51890 5190 51891 5191 wg-uk",
+            "sg 51892 51892 5192 51893 5193 wg-sg",
             "legacy 51888 wg-luodi",
         ])
+        # 各落地的业务标记（mark）和连落地机标记（epmark）绝不能撞车，规则优先级也互不冲突
+        rows = [line.split() for line in r.stdout.splitlines()[:3]]
+        marks = {row[1] for row in rows}
+        epmarks = {row[4] for row in rows}
+        prefs = {row[3] for row in rows}
+        epprefs = {row[5] for row in rows}
+        self.assertTrue(marks.isdisjoint(epmarks))
+        self.assertTrue(prefs.isdisjoint(epprefs))
 
     def test_ep_candidates_per_landing(self):
         r = self.sb.source('LND=uk; _ep_cands', {"WGL_L2TP_DIR": str(self.sb.tmp / "none")})
-        self.assertEqual(r.stdout.strip(), "51890")   # 第二个落地试自己的标记，不抢第一个的 51889
+        self.assertEqual(r.stdout.strip(), "51891")   # 第二个落地试自己的标记，不抢第一个的 51889，也不撞自己的 51890
         r = self.sb.source('LND=uk; _ep_cands', {"WGL_L2TP_DIR": str(self.sb.tmp / "none"),
                                                  "FAKE_IP_RULES": "8906:\\tfrom all fwmark 0x24682 lookup main\\n"})
-        self.assertEqual(r.stdout.strip(), "51890")   # 没装 L2TP-VPS：规则在也不借它的标记
+        self.assertEqual(r.stdout.strip(), "51891")   # 没装 L2TP-VPS：规则在也不借它的标记
 
     def test_gw_json_multi_userspace(self):
         j = self.gw_json("userspace")
@@ -375,6 +383,11 @@ class MultiLandingTest(unittest.TestCase):
         rules = j["route"]["rules"]
         self.assertEqual([r for r in rules if r.get("action") == "hijack-dns"],
                          [{"inbound": ["dns-" + n], "action": "hijack-dns"} for n in self.names])
+        self.assertEqual([r for r in rules if r.get("action") == "resolve"], [
+            {"inbound": ["socks-us"], "action": "resolve", "server": "wg-dns-us", "strategy": "ipv4_only"},
+            {"inbound": ["socks-uk"], "action": "resolve", "server": "wg-dns-uk", "strategy": "prefer_ipv4"},
+            {"inbound": ["socks-sg"], "action": "resolve", "server": "wg-dns-sg", "strategy": "ipv4_only"},
+        ])
         self.assertEqual([r for r in rules if "outbound" in r],
                          [{"inbound": ["socks-" + n], "outbound": "wg-" + n} for n in self.names])
         rej = [r for r in rules if r.get("action") == "reject"]
@@ -386,7 +399,11 @@ class MultiLandingTest(unittest.TestCase):
                                             "detour": "wg-us"})
         self.assertEqual(srv["wg-dns-uk"]["detour"], "wg-uk")
         self.assertEqual(j["dns"]["strategy"], "ipv4_only")   # 全局策略用第一个落地的
-        self.assertEqual(j["dns"]["rules"], [{"inbound": ["dns-" + n], "server": "wg-dns-" + n} for n in self.names])
+        self.assertEqual(j["dns"]["rules"], [
+            {"inbound": ["dns-us"], "server": "wg-dns-us", "strategy": "ipv4_only"},
+            {"inbound": ["dns-uk"], "server": "wg-dns-uk", "strategy": "prefer_ipv4"},
+            {"inbound": ["dns-sg"], "server": "wg-dns-sg", "strategy": "ipv4_only"},
+        ])
         self.assertEqual(j["dns"]["final"], "wg-dns-us")
         self.assertEqual(j["route"]["default_domain_resolver"], {"server": "wg-dns-us", "strategy": "ipv4_only"})
         self.assertNotIn("outbounds", j)
@@ -395,8 +412,8 @@ class MultiLandingTest(unittest.TestCase):
         j = self.gw_json("kernel")
         self.assertEqual(j["outbounds"], [
             {"type": "direct", "tag": "wg-out-us", "bind_interface": "wg-us", "routing_mark": 51888},
-            {"type": "direct", "tag": "wg-out-uk", "bind_interface": "wg-uk", "routing_mark": 51889},
-            {"type": "direct", "tag": "wg-out-sg", "bind_interface": "wg-sg", "routing_mark": 51890},
+            {"type": "direct", "tag": "wg-out-uk", "bind_interface": "wg-uk", "routing_mark": 51890},
+            {"type": "direct", "tag": "wg-out-sg", "bind_interface": "wg-sg", "routing_mark": 51892},
         ])
         self.assertNotIn("endpoints", j)
         self.assertEqual(j["route"]["final"], "wg-out-us")
@@ -405,7 +422,7 @@ class MultiLandingTest(unittest.TestCase):
         srv = {s["tag"]: s for s in j["dns"]["servers"]}
         self.assertEqual(srv["wg-dns-uk"],
                          {"type": "udp", "tag": "wg-dns-uk", "server": "10.66.0.1",
-                          "bind_interface": "wg-uk", "routing_mark": 51889})
+                          "bind_interface": "wg-uk", "routing_mark": 51890})
         self.assertNotIn("local", srv)   # 内核模式不用 local 解析器
 
     def test_kernel_up_down_per_landing(self):
@@ -427,8 +444,9 @@ class MultiLandingTest(unittest.TestCase):
         log = self.sb.fake_log()
         for want in ("ip link del dev wg-us", "ip link del dev wg-uk", "ip link del dev wg-sg",
                      "ip -4 rule del fwmark 51888 lookup 51888 pref 5188",
-                     "ip -4 rule del fwmark 51889 lookup 51889 pref 5189",
-                     "ip -4 route flush table 51890"):
+                     "ip -4 rule del fwmark 51890 lookup 51890 pref 5190",
+                     "ip -4 rule del fwmark 51891 lookup main pref 5191",
+                     "ip -4 route flush table 51892"):
             self.assertIn(want, log)
 
     def test_migrate_legacy(self):
@@ -478,6 +496,50 @@ class MultiLandingTest(unittest.TestCase):
             "MAP=31002:uk 31001:us 31003:sg",
             "MSG=端口 31001 走 us，端口 31002 走 uk",
         ])
+
+    def test_nat_alias_and_hop_port_landing(self):
+        # NAT 公网端口（link_port）和 Hysteria2 端口跳跃（hop）映射到节点内部监听端口的归属落地
+        r = self.sb.source('PORTS=$(_all_ports); '
+                           'echo "nat=$(_cfg_port_map 39001 31001 39001)"; '
+                           'echo "hop=$(_cfg_port_map 39002 31000-31005 39002)"; '
+                           'echo "direct=$(_cfg_port_map 31002 41000 31002)"')
+        self.assertEqual(r.stdout.splitlines(), [
+            "nat=39001:us",
+            "hop=39002:us",
+            "direct=31002:uk",
+        ])
+
+    def test_pick_gateway_ports_conflict(self):
+        # 与其它落地撞网关端口、或 SOCKS_PORT == DNS_PORT 时，必须换新端口；不冲突时原样保留
+        (self.sb.etc / "landings" / "sg" / "state").write_text(
+            "PORTS=31003\nEP_FAM=4\nEP_MARK=\nSOCKS_PORT=40001\nDNS_PORT=40006\n")
+        r = self.sb.source('pick_gateway_ports sg; echo "$(_lst_get sg SOCKS_PORT) $(_lst_get sg DNS_PORT)"')
+        sp, dp = r.stdout.strip().split()
+        self.assertNotIn(sp, ("40001", "40002", "40003", "40004"))
+        self.assertNotEqual(sp, dp)
+        # 不冲突时保留原端口
+        r = self.sb.source('pick_gateway_ports us; echo "$(_lst_get us SOCKS_PORT) $(_lst_get us DNS_PORT)"')
+        self.assertEqual(r.stdout.strip(), "40001 40002")
+
+    def test_write_gw_json_preserves_lnd(self):
+        out = self.sb.tmp / "gw-preserve.json"
+        r = self.sb.source('load_all; write_gw_json "%s"; echo "LND=$LND"' % out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "LND=us")
+
+    def test_do_landings_loads_init_and_wgl_ifaces(self):
+        (self.sb.etc / "state").write_text(
+            "LANDINGS=us uk sg\nMODE=userspace\nINIT=systemd\nSOCKS_USER=wgltest\nSOCKS_PASS=pw1\n")
+        r = self.sb.source('systemctl() { [ "$1" = is-active ] && return 0; }; '
+                           'wg_exit_ip() { echo "203.0.113.1"; }; '
+                           'do_landings; echo "IFACES=$(_wgl_ifaces)"')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("203.0.113.1", r.stdout)
+        self.assertIn("IFACES=wg-luodi wg-us wg-uk wg-sg", r.stdout)
+
+    def test_gw_wait_empty_port_fails_fast(self):
+        r = self.sb.source('WGL_WAIT=25; gw_wait nonexistent && echo OK || echo FAIL')
+        self.assertEqual(r.stdout.strip(), "FAIL")
 
 
 @unittest.skipUnless(have_bins(), "需要 WGL_TEST_BIN（xray、sing-box、hysteria）")
